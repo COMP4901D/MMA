@@ -1,0 +1,18 @@
+@"
+# Large data & model files
+# datasets/UTD-MHAD/
+checkpoints/
+runs/
+*.pt
+*.npy
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Misc
+cache/
+vis_results/
+"@ | Out-File -Encoding utf8 .gitignore

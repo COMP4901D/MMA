@@ -1,0 +1,12 @@
+name: mma-mac
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - -r mac_requirements.txt
+
+# Note: For optimal PyTorch installation on macOS (MPS or CPU), follow the official guide:
+# https://pytorch.org/get-started/locally/

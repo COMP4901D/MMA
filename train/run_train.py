@@ -2,21 +2,26 @@
 Unified Training Runner
 ========================
 Supports all MMA pipelines (utdmad, mmtsa, rgbd_imu) and baselines (mumu).
-Models and datasets are dynamically imported based on pipeline config or
-custom module/class paths.  Model-specific parameters are passed via JSON kwargs.
+Models and datasets are dynamically imported based on pipeline config.
+Each pipeline can specify a **trainer module** (e.g. ``train.mumu_train``)
+that provides its own ``get_criterion``, ``train_one_epoch``, and
+``evaluate`` functions.  Pipelines without a trainer module fall back to
+``train.default_train`` (standard CE loss).
 
 Usage:
+	python train/run_train.py --pipeline rgbd_imu --data_root datasets/UTD-MHAD \
+  --corruption_mode consecutive --corruption_p_consecutive 0.4
+
   python train/run_train.py --pipeline utdmad --data_root datasets/UTD-MHAD/Inertial
   python train/run_train.py --pipeline mmtsa  --data_root datasets/UTD-MHAD \\
          --model_kwargs '{"fusion":"gated"}'
-  python train/run_train.py --pipeline rgbd_imu --data_root datasets/UTD-MHAD \\
-         --model_kwargs '{"fusion":"attention"}'
+  python train/run_train.py --pipeline mumu   --data_root datasets/UTD-MHAD/Inertial
 
   # Custom model (not in registry):
   python train/run_train.py \\
          --model_module model.mma_utdmad --model_class MomentumMambaHAR \\
          --dataset_module datasets.utd_inertial --dataset_class UTDMADInertialDataset \\
-         --data_root datasets/UTD-MHAD/Inertial --input_mode unpack --output_mode logits
+         --data_root datasets/UTD-MHAD/Inertial --input_mode unpack
 """
 
 import argparse
@@ -33,12 +38,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    classification_report,
-    confusion_matrix,
-)
+from torch.optim.swa_utils import AveragedModel, SWALR
 
 # Ensure project root is importable
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +68,7 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "unpack",
         "output_mode": "logits",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {},
         "default_dataset_kwargs": {"max_len": 256},
         "norm_keys": ["mean", "std"],
@@ -80,6 +81,7 @@ PIPELINES = {
         "data_key": "data_root",
         "input_mode": "unpack",
         "output_mode": "tuple_first",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {"fusion": "attention"},
         "default_dataset_kwargs": {"num_segments": 3, "gaf_size": 64},
         "norm_keys": [],
@@ -92,6 +94,7 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "unpack",
         "output_mode": "logits",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {"fusion": "attention"},
         "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
         "norm_keys": ["iner_mean", "iner_std"],
@@ -104,12 +107,29 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "list",
         "output_mode": "mumu",
+        "trainer_module": "train.mumu_train",
         "default_model_kwargs": {
             "num_modalities": 1, "feature_dim": 128,
             "input_dim": 6, "num_activities": 27, "num_activity_groups": 5,
         },
         "default_dataset_kwargs": {"max_len": 256},
+        "default_trainer_kwargs": {"beta_aux": 0.5},
         "norm_keys": ["mean", "std"],
+    },
+    "skel_imu": {
+        "model_module": "model.mma_skel_imu",
+        "model_class": "MMA_SkeletonIMU",
+        "dataset_module": "datasets.utd_skel_imu",
+        "dataset_class": "UTDMADSkelIMUDataset",
+        "data_key": "data_dir",
+        "input_mode": "unpack",
+        "output_mode": "logits",
+        "trainer_module": "train.default_train",
+        "default_model_kwargs": {
+            "d_model": 128, "n_layers": 2, "fusion": "attention",
+        },
+        "default_dataset_kwargs": {"max_len_skel": 128, "max_len_imu": 192},
+        "norm_keys": ["skel_mean", "skel_std", "imu_mean", "imu_std"],
     },
 }
 
@@ -148,8 +168,26 @@ TRAIN_SUBJECTS = [1, 3, 5, 7]
 TEST_SUBJECTS = [2, 4, 6, 8]
 
 
+def _build_modality_dropout_kwargs(args) -> dict | None:
+    """Build `modality_dropout` dict from CLI corruption args.
+
+    Returns None when corruption is disabled.
+    """
+    if args.corruption_mode == "none":
+        return None
+    return {
+        "mode": args.corruption_mode,
+        "p_full": args.corruption_p_full,
+        "p_consecutive": args.corruption_p_consecutive,
+        "consecutive_len_range": tuple(args.corruption_block_range),
+        "modalities": args.corruption_modalities,
+        "both_drop_prob": args.corruption_both_drop_prob,
+    }
+
+
 def create_datasets(DatasetClass, data_key, data_root,
-                    default_ds_kwargs, user_ds_kwargs, norm_keys):
+                    default_ds_kwargs, user_ds_kwargs, norm_keys,
+                    modality_dropout_kwargs=None):
     """Create train and test datasets with proper normalisation propagation."""
     base_kw = {}
     base_kw.update(default_ds_kwargs)
@@ -160,6 +198,9 @@ def create_datasets(DatasetClass, data_key, data_root,
     train_kw.update(base_kw)
     if _accepts_kwarg(DatasetClass, "augment"):
         train_kw.setdefault("augment", True)
+    # Inject modality dropout into training set only
+    if modality_dropout_kwargs and _accepts_kwarg(DatasetClass, "modality_dropout"):
+        train_kw["modality_dropout"] = modality_dropout_kwargs
     train_ds = DatasetClass(**train_kw)
 
     # -- Test --
@@ -176,121 +217,21 @@ def create_datasets(DatasetClass, data_key, data_root,
 
 
 # ================================================================
-#  Forward / Loss Adapters
+#  Trainer Module Loader
 # ================================================================
 
-def model_forward(model, batch, device, input_mode):
-    """Run forward pass.  Returns (output, labels)."""
-    batch = [b.to(device) for b in batch]
-    labels = batch[-1]
-    inputs = batch[:-1]
-    if input_mode == "list":
-        output = model(inputs)
-    else:  # "unpack"
-        output = model(*inputs)
-    return output, labels
+def load_trainer(trainer_module_path: str):
+    """Import a trainer module and return its interface functions.
 
+    A trainer module must export:
+        get_criterion(args, **kwargs) -> nn.Module
+        train_one_epoch(model, loader, optimizer, criterion, device, cfg, args) -> (loss, acc)
+        evaluate(model, loader, criterion, device, cfg, args) -> metrics_dict
 
-def extract_logits(output, output_mode):
-    """Extract classification logits from model output."""
-    if output_mode == "tuple_first":
-        return output[0]
-    if output_mode == "mumu":
-        return output[1]  # y_target
-    return output  # "logits"
-
-
-# ================================================================
-#  Mixup
-# ================================================================
-
-def mixup_forward(model, batch, device, input_mode, output_mode, criterion, alpha):
-    """Apply mixup to all inputs, return (loss, logits, labels)."""
-    batch = [b.to(device) for b in batch]
-    labels = batch[-1]
-    inputs = batch[:-1]
-
-    lam = np.random.beta(alpha, alpha)
-    B = labels.size(0)
-    perm = torch.randperm(B, device=device)
-
-    mixed = [lam * x + (1 - lam) * x[perm] for x in inputs]
-    if input_mode == "list":
-        output = model(mixed)
-    else:
-        output = model(*mixed)
-
-    logits = extract_logits(output, output_mode)
-    loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels[perm])
-    return loss, logits, labels
-
-
-# ================================================================
-#  Training / Evaluation
-# ================================================================
-
-def train_one_epoch(model, loader, optimizer, criterion, device,
-                    input_mode, output_mode,
-                    clip_norm=1.0, mixup_alpha=0.0):
-    """Generic training epoch."""
-    model.train()
-    total_loss, correct, total = 0.0, 0, 0
-
-    for batch in loader:
-        optimizer.zero_grad()
-
-        if mixup_alpha > 0:
-            loss, logits, labels = mixup_forward(
-                model, batch, device, input_mode, output_mode,
-                criterion, mixup_alpha,
-            )
-        else:
-            output, labels = model_forward(model, batch, device, input_mode)
-            logits = extract_logits(output, output_mode)
-            loss = criterion(logits, labels)
-
-        loss.backward()
-        if clip_norm > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-        optimizer.step()
-
-        total_loss += loss.item() * labels.size(0)
-        correct += (logits.detach().argmax(1) == labels).sum().item()
-        total += labels.size(0)
-
-    return total_loss / total, correct / total
-
-
-@torch.no_grad()
-def evaluate(model, loader, criterion, device, input_mode, output_mode):
-    """Generic evaluation. Returns dict with loss, acc, prec, rec, f1, preds, labels."""
-    model.eval()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
-
-    for batch in loader:
-        output, labels = model_forward(model, batch, device, input_mode)
-        logits = extract_logits(output, output_mode)
-        total_loss += criterion(logits, labels).item() * labels.size(0)
-        all_preds.append(logits.argmax(1).cpu().numpy())
-        all_labels.append(labels.cpu().numpy())
-
-    preds = np.concatenate(all_preds)
-    labels = np.concatenate(all_labels)
-    n = len(labels)
-    acc = accuracy_score(labels, preds)
-    prec, rec, f1, _ = precision_recall_fscore_support(
-        labels, preds, average="weighted", zero_division=0,
-    )
-    return {
-        "loss": total_loss / n,
-        "acc": acc,
-        "prec": prec,
-        "rec": rec,
-        "f1": f1,
-        "preds": preds,
-        "labels": labels,
-    }
+    Returns: (get_criterion, train_one_epoch, evaluate)
+    """
+    mod = importlib.import_module(trainer_module_path)
+    return mod.get_criterion, mod.train_one_epoch, mod.evaluate
 
 
 # ================================================================
@@ -359,8 +300,11 @@ def parse_args():
                    choices=["unpack", "list"],
                    help="unpack: model(*inputs)  |  list: model(inputs)")
     p.add_argument("--output_mode", type=str, default=None,
-                   choices=["logits", "tuple_first", "mumu"],
-                   help="How to extract logits from model output")
+                   help="How to extract logits (handled by trainer module)")
+    p.add_argument("--trainer_module", type=str, default=None,
+                   help="Dotted path to trainer module (e.g. train.mumu_train)")
+    p.add_argument("--trainer_kwargs", type=str, default="",
+                   help="Trainer-specific constructor kwargs as JSON")
 
     # Training hyperparams
     p.add_argument("--epochs", type=int, default=100)
@@ -380,6 +324,24 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--mixup_alpha", type=float, default=0.0,
                    help="Mixup alpha (0 = disabled)")
+
+    # Corruption / modality dropout
+    p.add_argument("--corruption_mode", type=str, default="none",
+                   choices=["none", "full", "consecutive", "mixed"],
+                   help="Modality dropout mode (none = disabled)")
+    p.add_argument("--corruption_p_full", type=float, default=0.2,
+                   help="Per-modality probability of full dropout")
+    p.add_argument("--corruption_p_consecutive", type=float, default=0.3,
+                   help="Per-timestep probability of starting a dropout block")
+    p.add_argument("--corruption_block_range", type=int, nargs=2,
+                   default=[2, 6], metavar=("MIN", "MAX"),
+                   help="Min/max block length for consecutive dropout")
+    p.add_argument("--corruption_modalities", type=str, nargs="+",
+                   default=["rgbd", "imu"],
+                   help="Modalities eligible for dropout")
+    p.add_argument("--corruption_both_drop_prob", type=float, default=0.0,
+                   help="Probability that both modalities are dropped")
+
     p.add_argument("--patience", type=int, default=20,
                    help="Early stopping patience (0 = disabled)")
     p.add_argument("--early_stop_metric", type=str, default="acc",
@@ -394,6 +356,14 @@ def parse_args():
     p.add_argument("--save_name", type=str, default="best.pt")
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--compile", action="store_true",
+                   help="Use torch.compile for faster training")
+    p.add_argument("--swa", action="store_true",
+                   help="Enable Stochastic Weight Averaging (last swa_epochs)")
+    p.add_argument("--swa_start", type=float, default=0.75,
+                   help="Start SWA at this fraction of total epochs")
+    p.add_argument("--swa_lr", type=float, default=None,
+                   help="SWA learning rate (default: 0.05 * lr)")
     p.add_argument("--vis_dir", type=str, default="",
                    help="Directory for training visualisations (empty = off)")
     p.add_argument("--tb_dir", type=str, default="",
@@ -428,6 +398,8 @@ def main():
     output_mode = args.output_mode or cfg.get("output_mode", "logits")
     data_key = cfg.get("data_key", "data_root")
     norm_keys = cfg.get("norm_keys", [])
+    trainer_module_path = (args.trainer_module
+                           or cfg.get("trainer_module", "train.default_train"))
 
     if not (model_module and model_class_name):
         raise ValueError("Specify --pipeline or --model_module / --model_class")
@@ -444,11 +416,19 @@ def main():
 
     user_ds_kw = parse_json_kwargs(args.dataset_kwargs)
 
+    # -- Corruption / modality dropout --
+    modality_dropout_kwargs = _build_modality_dropout_kwargs(args)
+    if modality_dropout_kwargs:
+        print(f"Corruption: mode={modality_dropout_kwargs['mode']}, "
+              f"p_full={modality_dropout_kwargs['p_full']}, "
+              f"p_consec={modality_dropout_kwargs['p_consecutive']}")
+
     # -- Datasets --
     train_ds, test_ds = create_datasets(
         DatasetClass, data_key, args.data_root,
         cfg.get("default_dataset_kwargs", {}),
         user_ds_kw, norm_keys,
+        modality_dropout_kwargs=modality_dropout_kwargs,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -465,6 +445,25 @@ def main():
     model = ModelClass(**model_kwargs).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {model_class_name}  params={n_params:,}")
+
+    # -- torch.compile --
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("torch.compile enabled")
+
+    # -- CUDA optimisations --
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    # -- Load trainer module --
+    get_criterion, do_train_epoch, do_evaluate = load_trainer(trainer_module_path)
+    print(f"Trainer: {trainer_module_path}")
+
+    # Pipeline config dict passed to trainer functions
+    pipeline_cfg = {
+        "input_mode": input_mode,
+        "output_mode": output_mode,
+    }
 
     # -- Optimizer --
     if args.optimizer == "adamw":
@@ -489,8 +488,10 @@ def main():
             optimizer, step_size=args.step_size, gamma=args.step_gamma,
         )
 
-    # -- Loss --
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    # -- Loss (via trainer module) --
+    trainer_kwargs = cfg.get("default_trainer_kwargs", {}).copy()
+    trainer_kwargs.update(parse_json_kwargs(args.trainer_kwargs))
+    criterion = get_criterion(args, **trainer_kwargs)
 
     # -- Resume --
     start_epoch = 0
@@ -517,23 +518,35 @@ def main():
     # -- Training loop --
     no_improve = 0
 
+    # -- SWA setup --
+    swa_model = None
+    swa_scheduler = None
+    swa_start_epoch = int(args.swa_start * args.epochs) if args.swa else args.epochs + 1
+    if args.swa:
+        swa_model = AveragedModel(model)
+        swa_lr = args.swa_lr if args.swa_lr else args.lr * 0.05
+        swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
+        print(f"SWA enabled: start_epoch={swa_start_epoch}, swa_lr={swa_lr:.2e}")
+
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        tr_loss, tr_acc = train_one_epoch(
+        tr_loss, tr_acc = do_train_epoch(
             model, train_loader, optimizer, criterion, device,
-            input_mode, output_mode,
-            clip_norm=args.clip_grad, mixup_alpha=args.mixup_alpha,
+            pipeline_cfg, args,
         )
-        metrics = evaluate(
-            model, test_loader, criterion, device, input_mode, output_mode,
+        metrics = do_evaluate(
+            model, test_loader, criterion, device, pipeline_cfg, args,
         )
         val_loss = metrics["loss"]
         val_acc = metrics["acc"]
         val_f1 = metrics["f1"]
 
         # Scheduler step
-        if isinstance(scheduler, WarmupCosineScheduler):
+        if epoch >= swa_start_epoch and swa_scheduler is not None:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        elif isinstance(scheduler, WarmupCosineScheduler):
             scheduler.step(epoch)
         elif scheduler is not None:
             scheduler.step()
@@ -594,12 +607,51 @@ def main():
         ckpt = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
 
-    final = evaluate(
-        model, test_loader, criterion, device, input_mode, output_mode,
+    final = do_evaluate(
+        model, test_loader, criterion, device, pipeline_cfg, args,
     )
     print(f"\n{'='*50}")
     print(f"Best model  Acc={final['acc']:.4f}  F1={final['f1']:.4f}")
     print(f"{'='*50}")
+
+    # -- SWA: update BN and evaluate --
+    if swa_model is not None and args.swa:
+        # Custom BN update: handles multi-input models (skel+imu, rgbd+imu, etc.)
+        momenta = {}
+        for module in swa_model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                module.reset_running_stats()
+                momenta[module] = module.momentum
+                module.momentum = None  # cumulative mean
+        if momenta:
+            swa_model.train()
+            with torch.no_grad():
+                for batch in train_loader:
+                    batch = [b.to(device) for b in batch]
+                    inputs = batch[:-1]
+                    if pipeline_cfg.get("input_mode") == "list":
+                        swa_model(inputs)
+                    else:
+                        swa_model(*inputs)
+            for module, mom in momenta.items():
+                module.momentum = mom
+            swa_model.eval()
+        swa_final = do_evaluate(
+            swa_model, test_loader, criterion, device, pipeline_cfg, args,
+        )
+        print(f"SWA model   Acc={swa_final['acc']:.4f}  F1={swa_final['f1']:.4f}")
+        if swa_final["acc"] >= final["acc"]:
+            print("SWA model is better — saving as checkpoint")
+            torch.save({
+                "epoch": args.epochs,
+                "model_state": swa_model.module.state_dict(),
+                "best_metric": swa_final["acc"],
+                "pipeline": args.pipeline,
+                "model_kwargs": model_kwargs,
+                "args": vars(args),
+            }, os.path.join(args.save_dir, args.save_name))
+            final = swa_final
+        print(f"{'='*50}")
 
     # -- TensorBoard: log hparams --
     if tb_writer:

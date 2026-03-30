@@ -34,10 +34,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
     classification_report,
-    confusion_matrix,
 )
 
 # Ensure project root is importable
@@ -65,6 +62,7 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "unpack",
         "output_mode": "logits",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {},
         "default_dataset_kwargs": {"max_len": 256},
         "norm_keys": ["mean", "std"],
@@ -77,6 +75,7 @@ PIPELINES = {
         "data_key": "data_root",
         "input_mode": "unpack",
         "output_mode": "tuple_first",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {"fusion": "attention"},
         "default_dataset_kwargs": {"num_segments": 3, "gaf_size": 64},
         "norm_keys": [],
@@ -89,6 +88,7 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "unpack",
         "output_mode": "logits",
+        "trainer_module": "train.default_train",
         "default_model_kwargs": {"fusion": "attention"},
         "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
         "norm_keys": ["iner_mean", "iner_std"],
@@ -101,12 +101,29 @@ PIPELINES = {
         "data_key": "data_dir",
         "input_mode": "list",
         "output_mode": "mumu",
+        "trainer_module": "train.mumu_train",
         "default_model_kwargs": {
             "num_modalities": 1, "feature_dim": 128,
             "input_dim": 6, "num_activities": 27, "num_activity_groups": 5,
         },
         "default_dataset_kwargs": {"max_len": 256},
+        "default_trainer_kwargs": {"beta_aux": 0.5},
         "norm_keys": ["mean", "std"],
+    },
+    "skel_imu": {
+        "model_module": "model.mma_skel_imu",
+        "model_class": "MMA_SkeletonIMU",
+        "dataset_module": "datasets.utd_skel_imu",
+        "dataset_class": "UTDMADSkelIMUDataset",
+        "data_key": "data_dir",
+        "input_mode": "unpack",
+        "output_mode": "logits",
+        "trainer_module": "train.default_train",
+        "default_model_kwargs": {
+            "d_model": 128, "n_layers": 2, "fusion": "attention",
+        },
+        "default_dataset_kwargs": {"max_len_skel": 128, "max_len_imu": 192},
+        "norm_keys": ["skel_mean", "skel_std", "imu_mean", "imu_std"],
     },
 }
 
@@ -143,8 +160,26 @@ TRAIN_SUBJECTS = [1, 3, 5, 7]
 TEST_SUBJECTS = [2, 4, 6, 8]
 
 
+def _build_modality_dropout_kwargs(args) -> dict | None:
+    """Build `modality_dropout` dict from CLI corruption args.
+
+    Returns None when corruption is disabled.
+    """
+    if args.corruption_mode == "none":
+        return None
+    return {
+        "mode": args.corruption_mode,
+        "p_full": args.corruption_p_full,
+        "p_consecutive": args.corruption_p_consecutive,
+        "consecutive_len_range": tuple(args.corruption_block_range),
+        "modalities": args.corruption_modalities,
+        "both_drop_prob": args.corruption_both_drop_prob,
+    }
+
+
 def create_test_dataset(DatasetClass, data_key, data_root,
-                        default_ds_kwargs, user_ds_kwargs, norm_keys):
+                        default_ds_kwargs, user_ds_kwargs, norm_keys,
+                        modality_dropout_kwargs=None):
     """Create train (for norm stats) and test datasets."""
     base_kw = {}
     base_kw.update(default_ds_kwargs)
@@ -155,6 +190,9 @@ def create_test_dataset(DatasetClass, data_key, data_root,
     test_kw.update(base_kw)
     if _accepts_kwarg(DatasetClass, "augment"):
         test_kw["augment"] = False
+    # Inject modality dropout for robustness evaluation
+    if modality_dropout_kwargs and _accepts_kwarg(DatasetClass, "modality_dropout"):
+        test_kw["modality_dropout"] = modality_dropout_kwargs
 
     if norm_keys:
         train_kw = {data_key: data_root, "subjects": TRAIN_SUBJECTS}
@@ -171,27 +209,13 @@ def create_test_dataset(DatasetClass, data_key, data_root,
 
 
 # ================================================================
-#  Forward Adapters
+#  Trainer Module Loader
 # ================================================================
 
-def model_forward(model, batch, device, input_mode):
-    """Run forward pass. Returns (output, labels)."""
-    batch = [b.to(device) for b in batch]
-    labels = batch[-1]
-    inputs = batch[:-1]
-    if input_mode == "list":
-        output = model(inputs)
-    else:
-        output = model(*inputs)
-    return output, labels
-
-
-def extract_logits(output, output_mode):
-    if output_mode == "tuple_first":
-        return output[0]
-    if output_mode == "mumu":
-        return output[1]
-    return output
+def load_trainer(trainer_module_path: str):
+    """Import a trainer module and return its evaluate function."""
+    mod = importlib.import_module(trainer_module_path)
+    return mod.get_criterion, mod.evaluate
 
 
 # ================================================================
@@ -212,19 +236,44 @@ def parse_args():
     p.add_argument("--dataset_kwargs", type=str, default="",
                    help="Dataset constructor kwargs as JSON")
     p.add_argument("--data_root", type=str, required=True)
-    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, required=True, nargs="+",
+                   help="Path(s) to checkpoint file(s). Multiple for ensemble.")
 
     p.add_argument("--input_mode", type=str, default=None,
                    choices=["unpack", "list"])
     p.add_argument("--output_mode", type=str, default=None,
-                   choices=["logits", "tuple_first", "mumu"])
+                   help="How to extract logits (handled by trainer module)")
+    p.add_argument("--trainer_module", type=str, default=None,
+                   help="Dotted path to trainer module")
+    p.add_argument("--trainer_kwargs", type=str, default="",
+                   help="Trainer-specific constructor kwargs as JSON")
 
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
+
+    # Corruption / modality dropout (for robustness evaluation)
+    p.add_argument("--corruption_mode", type=str, default="none",
+                   choices=["none", "full", "consecutive", "mixed"],
+                   help="Modality dropout mode (none = disabled)")
+    p.add_argument("--corruption_p_full", type=float, default=0.2,
+                   help="Per-modality probability of full dropout")
+    p.add_argument("--corruption_p_consecutive", type=float, default=0.3,
+                   help="Per-timestep probability of starting a dropout block")
+    p.add_argument("--corruption_block_range", type=int, nargs=2,
+                   default=[2, 6], metavar=("MIN", "MAX"),
+                   help="Min/max block length for consecutive dropout")
+    p.add_argument("--corruption_modalities", type=str, nargs="+",
+                   default=["rgbd", "imu"],
+                   help="Modalities eligible for dropout")
+    p.add_argument("--corruption_both_drop_prob", type=float, default=0.0,
+                   help="Probability that both modalities are dropped")
+
     p.add_argument("--output", type=str, default="preds.npz",
                    help="Path to save predictions (.npz)")
+    p.add_argument("--compile", action="store_true",
+                   help="Use torch.compile for faster inference")
     p.add_argument("--vis_dir", type=str, default="",
                    help="Directory for evaluation plots (empty = off)")
 
@@ -239,8 +288,11 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    # -- Load checkpoint --
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    checkpoints = args.checkpoint if isinstance(args.checkpoint, list) else [args.checkpoint]
+    is_ensemble = len(checkpoints) > 1
+
+    # -- Load first checkpoint for config --
+    ckpt = torch.load(checkpoints[0], map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
 
     # -- Resolve pipeline config --
@@ -255,6 +307,8 @@ def main():
     output_mode = args.output_mode or cfg.get("output_mode", "logits")
     data_key = cfg.get("data_key", "data_root")
     norm_keys = cfg.get("norm_keys", [])
+    trainer_module_path = (args.trainer_module
+                           or cfg.get("trainer_module", "train.default_train"))
 
     if not (model_module and model_class_name):
         raise ValueError("Specify --pipeline or --model_module / --model_class")
@@ -272,6 +326,13 @@ def main():
 
     user_ds_kw = parse_json_kwargs(args.dataset_kwargs)
 
+    # -- Corruption / modality dropout --
+    modality_dropout_kwargs = _build_modality_dropout_kwargs(args)
+    if modality_dropout_kwargs:
+        print(f"Corruption: mode={modality_dropout_kwargs['mode']}, "
+              f"p_full={modality_dropout_kwargs['p_full']}, "
+              f"p_consec={modality_dropout_kwargs['p_consecutive']}")
+
     # -- Model --
     model = ModelClass(**model_kwargs).to(device)
 
@@ -279,15 +340,21 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
+    # -- torch.compile --
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("torch.compile enabled")
+
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {model_class_name}  params={n_params:,}")
-    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Checkpoint(s): {', '.join(checkpoints)}")
 
     # -- Dataset --
     test_ds = create_test_dataset(
         DatasetClass, data_key, args.data_root,
         cfg.get("default_dataset_kwargs", {}),
         user_ds_kw, norm_keys,
+        modality_dropout_kwargs=modality_dropout_kwargs,
     )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
@@ -295,34 +362,72 @@ def main():
     )
     print(f"Test samples: {len(test_ds)}")
 
-    # -- Inference --
-    all_preds, all_labels = [], []
-    total_loss = 0.0
-    criterion = nn.CrossEntropyLoss()
+    # -- Load trainer module --
+    get_criterion, do_evaluate = load_trainer(trainer_module_path)
+    trainer_kwargs = cfg.get("default_trainer_kwargs", {}).copy()
+    trainer_kwargs.update(parse_json_kwargs(args.trainer_kwargs))
 
-    with torch.no_grad():
-        for batch in test_loader:
-            output, labels = model_forward(model, batch, device, input_mode)
-            logits = extract_logits(output, output_mode)
-            total_loss += criterion(logits, labels).item() * labels.size(0)
-            all_preds.append(logits.argmax(1).cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+    # Build a minimal args-like object for the trainer's evaluate()
+    class _InferArgs:
+        label_smoothing = 0.0
+        clip_grad = 0.0
+        mixup_alpha = 0.0
+    infer_args = _InferArgs()
 
-    preds = np.concatenate(all_preds)
-    labels = np.concatenate(all_labels)
-    n = len(labels)
+    criterion = get_criterion(infer_args, **trainer_kwargs)
+    pipeline_cfg = {"input_mode": input_mode, "output_mode": output_mode}
 
-    # -- Metrics --
-    acc = accuracy_score(labels, preds)
-    prec, rec, f1, _ = precision_recall_fscore_support(
-        labels, preds, average="weighted", zero_division=0,
-    )
+    # -- Inference (single or ensemble) --
+    if is_ensemble:
+        print(f"\nEnsemble mode: {len(checkpoints)} models")
+        all_logits = []
+        labels = None
+        for i, ckpt_path in enumerate(checkpoints):
+            ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+            state_i = ck.get("model_state") or ck.get("state_dict") or ck
+            model.load_state_dict(state_i)
+            model.eval()
+            res = do_evaluate(model, test_loader, criterion, device, pipeline_cfg, infer_args)
+            all_logits.append(res.get("logits"))
+            if labels is None:
+                labels = res["labels"]
+            print(f"  Model {i+1}: Acc={res['acc']:.4f} F1={res['f1']:.4f}")
+
+        # Average logits and re-compute metrics
+        if all_logits[0] is not None:
+            avg_logits = np.mean(all_logits, axis=0)
+            preds = np.argmax(avg_logits, axis=1)
+        else:
+            # Fallback: majority vote on predictions
+            from scipy.stats import mode as scipy_mode
+            all_preds = np.array([r.get("preds") for r in [
+                do_evaluate(model, test_loader, criterion, device, pipeline_cfg, infer_args)
+            ]])
+            preds = scipy_mode(all_preds, axis=0).mode.flatten()
+
+        from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+        acc = accuracy_score(labels, preds)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            labels, preds, average="weighted", zero_division=0,
+        )
+        n = len(labels)
+        results = {"acc": acc, "prec": prec, "rec": rec, "f1": f1,
+                    "preds": preds, "labels": labels, "loss": 0.0}
+    else:
+        results = do_evaluate(model, test_loader, criterion, device, pipeline_cfg, infer_args)
+        preds = results["preds"]
+        labels = results["labels"]
+        n = len(labels)
+        acc = results["acc"]
+        prec = results["prec"]
+        rec = results["rec"]
+        f1 = results["f1"]
     print(f"\nTest Results ({n} samples):")
     print(f"  Accuracy : {acc:.4f}")
     print(f"  Precision: {prec:.4f}")
     print(f"  Recall   : {rec:.4f}")
     print(f"  F1       : {f1:.4f}")
-    print(f"  Loss     : {total_loss / n:.4f}")
+    print(f"  Loss     : {results['loss']:.4f}")
 
     try:
         from datasets import ACTION_NAMES

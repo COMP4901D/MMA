@@ -18,6 +18,15 @@
       -DatasetModule "datasets.utd_inertial" -DatasetClass "UTDMADInertialDataset" `
       -DataRoot "./datasets/UTD-MHAD/Inertial" -Checkpoint best.pt `
       -InputMode unpack -OutputMode logits
+
+  # Robustness evaluation: full modality dropout on test set
+  .\script\run_infer.ps1 -Pipeline rgbd_imu -Checkpoint checkpoints/best.pt `
+      -CorruptionMode full -CorruptionPFull 0.3
+
+  # Robustness evaluation: consecutive dropout on IMU only
+  .\script\run_infer.ps1 -Pipeline rgbd_imu -Checkpoint checkpoints/best.pt `
+      -CorruptionMode consecutive -CorruptionPConsecutive 0.5 `
+      -CorruptionModalities "imu" -VisDir vis_corrupt
 #>
 
 param(
@@ -46,11 +55,20 @@ param(
     [string]$Output  = "preds.npz",
     [string]$VisDir  = "",
 
+    # ── Corruption / modality dropout (robustness evaluation) ──
+    [string]$CorruptionMode = "none",        # none | full | consecutive | mixed
+    [double]$CorruptionPFull = 0.2,           # per-modality full-dropout probability
+    [double]$CorruptionPConsecutive = 0.3,    # per-timestep block-start probability
+    [int[]]$CorruptionBlockRange = @(2, 6),    # (min, max) consecutive block length
+    [string[]]$CorruptionModalities = @("rgbd", "imu"),  # eligible modalities
+    [double]$CorruptionBothDropProb = 0.0,    # probability both modalities drop
+
     # ── Infrastructure ──
     [int]$BatchSize   = 32,
     [int]$NumWorkers  = 4,
     [string]$CUDA     = "",
-    [string]$Device   = ""
+    [string]$Device   = "",
+    [switch]$Compile
 )
 
 # ── Cache ──
@@ -82,6 +100,21 @@ if (-not [string]::IsNullOrEmpty($InputMode))      { $pyArgs += @("--input_mode"
 if (-not [string]::IsNullOrEmpty($OutputMode))     { $pyArgs += @("--output_mode", $OutputMode) }
 if (-not [string]::IsNullOrEmpty($Device))         { $pyArgs += @("--device", $Device) }
 if (-not [string]::IsNullOrEmpty($VisDir))         { $pyArgs += @("--vis_dir", $VisDir) }
+
+# torch.compile
+if ($Compile) { $pyArgs += @("--compile") }
+
+# Corruption / modality dropout
+if ($CorruptionMode -ne "none") {
+    $pyArgs += @("--corruption_mode", $CorruptionMode)
+    $pyArgs += @("--corruption_p_full", $CorruptionPFull)
+    $pyArgs += @("--corruption_p_consecutive", $CorruptionPConsecutive)
+
+    $pyArgs += @("--corruption_block_range", $CorruptionBlockRange[0], $CorruptionBlockRange[1])
+    $pyArgs += @("--corruption_modalities") + $CorruptionModalities
+
+    $pyArgs += @("--corruption_both_drop_prob", $CorruptionBothDropProb)
+}
 
 # ── Run ──
 Write-Host "Running: python $($pyArgs -join ' ')" -ForegroundColor Cyan

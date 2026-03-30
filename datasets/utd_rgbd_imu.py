@@ -20,7 +20,7 @@ import torch
 from scipy.interpolate import interp1d
 from torch.utils.data import Dataset
 
-from .transforms import GAFEncoder
+from .transforms import GAFEncoder, ModalityDropout
 
 
 class UTDMADRGBDIMUDataset(Dataset):
@@ -42,6 +42,7 @@ class UTDMADRGBDIMUDataset(Dataset):
         iner_std=None,
         imu_as_gaf: bool = False,
         gaf_size: int = 64,
+        modality_dropout: dict = None,
     ):
         super().__init__()
         self.n_frames = n_frames
@@ -50,6 +51,13 @@ class UTDMADRGBDIMUDataset(Dataset):
         self.depth_clip = depth_clip
         self.imu_as_gaf = imu_as_gaf
         self.gaf_size = gaf_size
+
+        # Modality-loss simulation (training only)
+        if modality_dropout is not None:
+            self.modality_dropout = ModalityDropout(**modality_dropout)
+        else:
+            self.modality_dropout = None
+        self._rng = np.random.default_rng()
 
         # Locate folders
         iner_dir = os.path.join(data_dir, "Inertial")
@@ -229,15 +237,20 @@ class UTDMADRGBDIMUDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        rgbd = torch.as_tensor(self.rgbd_data[idx], dtype=torch.float32)
+        rgbd = self.rgbd_data[idx]  # (T, 4, H, W) float32 ndarray
 
         imu = (self.imu_data[idx] - self.iner_mean) / self.iner_std
         if self.imu_as_gaf:
-            imu_gaf = GAFEncoder.encode_multi(imu, self.gaf_size)
-            imu = torch.as_tensor(imu_gaf, dtype=torch.float32)
+            imu = GAFEncoder.encode_multi(imu, self.gaf_size)
         else:
             imu = self._resample_1d(imu, self.max_imu_len)
-            imu = torch.as_tensor(imu, dtype=torch.float32)
+
+        # Apply modality dropout *before* converting to tensor
+        if self.modality_dropout is not None:
+            rgbd, imu = self.modality_dropout(rgbd, imu, rng=self._rng)
+
+        rgbd = torch.as_tensor(rgbd, dtype=torch.float32)
+        imu = torch.as_tensor(imu, dtype=torch.float32)
 
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return rgbd, imu, label

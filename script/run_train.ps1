@@ -23,6 +23,18 @@
   .\script\run_train.ps1 -ModelModule "baselines.MuMu.MuMu" -ModelClass "MuMu" `
       -DatasetModule "datasets.utd_inertial" -DatasetClass "UTDMADInertialDataset" `
       -DataRoot "./datasets/UTD-MHAD/Inertial" -InputMode list -OutputMode mumu
+
+  # Train RGBD-IMU with consecutive modality dropout (sensor failure simulation)
+  .\script\run_train.ps1 -Pipeline rgbd_imu -CorruptionMode consecutive `
+      -CorruptionPConsecutive 0.4 -CorruptionBlockRange 3,8
+
+  # Train RGBD-IMU with full modality dropout on IMU only
+  .\script\run_train.ps1 -Pipeline rgbd_imu -CorruptionMode full `
+      -CorruptionPFull 0.3 -CorruptionModalities "imu"
+
+  # Train with mixed corruption (randomly picks full or consecutive per sample)
+  .\script\run_train.ps1 -Pipeline rgbd_imu -CorruptionMode mixed `
+      -CorruptionPFull 0.2 -CorruptionPConsecutive 0.3
 #>
 
 param(
@@ -61,6 +73,14 @@ param(
     [string]$EarlyStopMetric = "acc",     # acc | f1
     [int]$Seed = 42,
 
+    # ── Corruption / modality dropout ──
+    [string]$CorruptionMode = "none",        # none | full | consecutive | mixed
+    [double]$CorruptionPFull = 0.2,           # per-modality full-dropout probability
+    [double]$CorruptionPConsecutive = 0.3,    # per-timestep block-start probability
+    [int[]]$CorruptionBlockRange = @(2, 6),    # (min, max) consecutive block length
+    [string[]]$CorruptionModalities = @("rgbd", "imu"),  # eligible modalities
+    [double]$CorruptionBothDropProb = 0.0,    # probability both modalities drop
+
     # ── Output ──
     [string]$SaveDir = "checkpoints",
     [string]$SaveName = "best.pt",
@@ -71,7 +91,8 @@ param(
     # ── Device ──
     [string]$CUDA = "",
     [string]$Device = "",
-    [int]$NumWorkers = 4
+    [int]$NumWorkers = 4,
+    [switch]$Compile
 )
 
 # ── Cache directories ──
@@ -134,6 +155,21 @@ if (-not [string]::IsNullOrEmpty($VisDir)) { $pyArgs += @("--vis_dir", $VisDir) 
 
 # TensorBoard
 if (-not [string]::IsNullOrEmpty($TbDir)) { $pyArgs += @("--tb_dir", $TbDir) }
+
+# torch.compile
+if ($Compile) { $pyArgs += @("--compile") }
+
+# Corruption / modality dropout
+if ($CorruptionMode -ne "none") {
+    $pyArgs += @("--corruption_mode", $CorruptionMode)
+    $pyArgs += @("--corruption_p_full", $CorruptionPFull)
+    $pyArgs += @("--corruption_p_consecutive", $CorruptionPConsecutive)
+
+    $pyArgs += @("--corruption_block_range", $CorruptionBlockRange[0], $CorruptionBlockRange[1])
+    $pyArgs += @("--corruption_modalities") + $CorruptionModalities
+
+    $pyArgs += @("--corruption_both_drop_prob", $CorruptionBothDropProb)
+}
 
 # ── Run ──
 Write-Host "Running: python $($pyArgs -join ' ')" -ForegroundColor Cyan

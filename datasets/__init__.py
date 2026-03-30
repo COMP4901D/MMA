@@ -17,6 +17,8 @@ ACTION_NAMES = [
     "jog", "walk", "sit2stand", "stand2sit", "lunge", "squat",
 ]
 
+from .transforms import ModalityDropout
 from .utd_inertial import UTDMADInertialDataset
 from .utd_depth_imu import UTD_MHAD_Dataset
 from .utd_rgbd_imu import UTDMADRGBDIMUDataset
+from .utd_skel_imu import UTDMADSkelIMUDataset

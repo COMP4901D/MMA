@@ -272,3 +272,201 @@ python train/run_train.py --pipeline skel_imu --data_root "./datasets/UTD-MHAD" 
   --scheduler cosine_warmup --warmup_epochs 5 --lr 3e-4 --patience 40 --seed 42 `
   --model_kwargs '{"d_model":160,"fusion":"cross_mamba","modality_dropout":0.0,"aux_weight":0.1}'
 ```
+
+---
+---
+
+# MMA RGBD+IMU Multimodal HAR — Experiment Report
+
+## 1. Motivation
+
+Skeleton data requires external preprocessing (pose estimation) before training. To remove this dependency, we explore replacing skeleton with **raw RGBD video** (RGB + Depth) while keeping IMU. This section documents the RGBD+IMU experiments (R1–R9) and compares with the skeleton+IMU pipeline.
+
+## 2. Model Architecture
+
+### 2.1 Overview
+
+**MultimodalMMA (RGBD+IMU)** reuses the same proven architecture from the skeleton+IMU pipeline (cross_mamba fusion, auxiliary loss, AttentionPool, DimGatedFusion), replacing only the skeleton branch with a visual encoder.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  MultimodalMMA (RGBD+IMU)                   │
+│                                                             │
+│  ┌────────────────────┐    ┌───────────────────┐            │
+│  │   RGBD Encoder     │    │   IMU Encoder     │            │
+│  │  (SpatialCNN /     │    │  (Conv1D)         │            │
+│  │   ResNet18)        │    │                    │            │
+│  │  per-frame → (B,T,D)   │  (B,T,6)→(B,T,D)  │            │
+│  │  [+ Temporal Vel]  │    │                    │            │
+│  │       ↓            │    │       ↓            │            │
+│  │  MambaBlock ×N     │    │  MambaBlock ×N     │            │
+│  │       ↓            │    │       ↓            │            │
+│  │  RMSNorm           │    │  RMSNorm           │            │
+│  └────────┬───────────┘    └─────────┬──────────┘            │
+│           │   (Optional Aux Head)    │                      │
+│           └───────────┬──────────────┘                      │
+│                       │ Fusion                              │
+│            ┌──────────┴──────────┐                          │
+│            │ Cross-Mamba / Attn  │                          │
+│            │ / Gated / Concat    │                          │
+│            └──────────┬──────────┘                          │
+│                       ↓                                     │
+│               Classification Head                           │
+│               Dropout → Linear(D, 27)                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 RGBD Encoder Variants
+
+| Variant | Input | Frontend | Params | Description |
+|---------|-------|----------|--------|-------------|
+| `spatial_cnn` (default) | (B, T, 4, 112, 112) | 4-layer stride-2 Conv2D → per-frame feature | ~340K | Lightweight, trains from scratch |
+| `pretrained_cnn` (ResNet18) | (B, T, 4, 112, 112) | ImageNet-pretrained ResNet18, first conv adapted 3→4 channels | ~11.2M | Pretrained visual features |
+
+**Freeze modes** (for `pretrained_cnn`):
+- `all`: Only final projection layer trainable (~82K trainable)
+- `partial`: layer4 + projection trainable (~2.6M trainable)
+- `none`: Full fine-tuning (~11.2M trainable)
+
+### 2.3 Temporal Velocity Features
+
+When `temporal_velocity=True`, the encoder computes frame-level feature differences (analogous to skeleton velocity features):
+
+$$v_t = f_t - f_{t-1}, \quad v_0 = 0$$
+
+The velocity features are concatenated with the original features and projected back: `Linear(2D, D) → LN → ReLU`.
+
+### 2.4 Data Augmentation
+
+RGBD augmentations (train only, `augment=True`):
+- Random horizontal flip (p=0.5)
+- Random crop (scale 0.8–1.0) + resize to 112×112
+- Color jitter (brightness/contrast ±15%) on RGB channels only
+
+IMU augmentations:
+- Jitter (σ=0.03)
+- Scaling (σ=0.1)
+
+### 2.5 Optical Flow (Experimental)
+
+When `use_flow=True`, 2 additional channels of dense optical flow (computed via Farnebäck method) are appended, resulting in 6-channel input (RGBD + flow_x + flow_y). This did not improve results (see R8).
+
+## 3. RGBD Data Pipeline
+
+```
+RGB (.avi, 640×480)  ──→  resize 112×112  ──→  normalize [0,1]  ──┐
+Depth (.mat, 320×240) ─→  resize 112×112  ──→  normalize [0,1]  ──┤
+                                                                    ↓
+                                              Stack → (T, 4, 112, 112)
+                                              Uniform sample T=16 frames
+                                                                    ↓
+                                              Total per-sample: 16 × 4 × 112 × 112 = 802,816 values
+```
+
+Compare with skeleton: `128 × 60 = 7,680 values` — a **105× input dimensionality gap**.
+
+## 4. Experiment Results
+
+### 4.1 Phase 1: Baseline RGBD+IMU (R1–R2)
+
+All experiments use the same training config as skeleton+IMU best (label_smoothing=0.1, mixup_alpha=0.15, weight_decay=0.008, cosine_warmup, patience=40) unless noted.
+
+| Exp | Encoder | Fusion | aux_w | bs | lr | Acc | F1 | Notes |
+|-----|---------|--------|-------|----|----|-----|-----|-------|
+| R1 | SpatialCNN | cross_mamba | 0.1 | 8 | 3e-4 | 0.8930 | 0.8882 | Baseline |
+| R2 | SpatialCNN | attention | 0.1 | 8 | 3e-4 | 0.8767 | 0.8711 | Attention fusion weaker |
+
+### 4.2 Phase 2: Pretrained CNN + Velocity + Augmentation (R3–R6)
+
+Three improvements applied: (1) pretrained ResNet18 backbone, (2) temporal velocity features, (3) data augmentation.
+
+| Exp | Encoder | Freeze | vel | aug | bs | lr | Acc | F1 | Notes |
+|-----|---------|--------|-----|-----|----|----|-----|-----|-------|
+| R3 | ResNet18 | all | ✓ | ✓ | 8 | 3e-4 | 0.8860 | 0.8819 | Frozen backbone under-fits |
+| **R4** | **ResNet18** | **partial** | **✓** | **✓** | **8** | **3e-4** | **0.8977** | **0.8951** | **RGBD BEST** |
+| R5 | SpatialCNN | — | ✓ | ✓ | 8 | 3e-4 | 0.8953 | 0.8929 | SpatialCNN competitive |
+| R6 | ResNet18 | none | ✓ | ✓ | 8 | 1e-4 | 0.8977 | 0.8955 | Full finetune ties R4 |
+
+### 4.3 Phase 3: Additional Exploration (R7–R9)
+
+| Exp | Configuration | bs | Acc | Notes |
+|-----|---------------|-----|-----|-------|
+| R7 | R4 config + 32 frames | 4 | 0.8837 | OOM at epoch 51, more frames didn't help |
+| R8 | Optical flow (6ch) + vel + aug | 32 | 0.8791 | Flow didn't improve, bs=32 hurt |
+| R9 | SpatialCNN + vel + aug | 32 | 0.8558 | bs=32 clearly hurts convergence |
+
+## 5. RGBD+IMU Leaderboard
+
+| Rank | Exp | Configuration | Acc | F1 |
+|------|-----|--------------|-----|-----|
+| 🥇 | **R4** | ResNet18 partial + velocity + augmentation, bs=8 | **0.8977** | **0.8951** |
+| 🥇 | R6 | ResNet18 full finetune + vel + aug, bs=8, lr=1e-4 | 0.8977 | 0.8955 |
+| 3 | R5 | SpatialCNN + vel + aug, bs=8 | 0.8953 | 0.8929 |
+| 4 | R1 | SpatialCNN + cross_mamba, bs=8 | 0.8930 | 0.8882 |
+| 5 | R3 | ResNet18 frozen + vel + aug, bs=8 | 0.8860 | 0.8819 |
+| 6 | R7 | R4 + 32 frames, bs=4 | 0.8837 | — |
+| 7 | R8 | Flow (6ch) + vel + aug, bs=32 | 0.8791 | — |
+| 8 | R2 | SpatialCNN + attention, bs=8 | 0.8767 | 0.8711 |
+| 9 | R9 | SpatialCNN + vel + aug, bs=32 | 0.8558 | — |
+
+## 6. Key Findings
+
+### Why RGBD ≪ Skeleton (0.90 vs 0.96)
+
+The fundamental gap comes from **input representation quality**, not architecture:
+
+| Property | Skeleton (60-dim) | RGBD (50,176-dim per frame) |
+|----------|-------------------|----------------------------|
+| Dimensionality | 60 (20 joints × 3) | 50,176 (4 × 112 × 112) |
+| Noise | None (clean joint coordinates) | Background, lighting, clothing |
+| Semantic density | Every value is action-relevant | Mostly irrelevant background pixels |
+| Structure | Body topology preserved | Raw pixel grid |
+| Temporal features | Velocity = simple diff | Requires learned motion features |
+
+With only **431 training samples**, there is insufficient data to learn the visual abstraction that skeleton preprocessing provides for free.
+
+### What Worked
+1. **Partial freeze (ResNet18 layer4)**: Best balance — leverages ImageNet features while adapting to action recognition
+2. **Temporal velocity features**: Feature-level frame differences provide motion cues analogous to skeleton velocity
+3. **Data augmentation**: Flip + crop + color jitter + IMU jitter/scaling consistently improve generalization
+4. **Small batch size (8)**: More gradient updates per epoch critical on 431 samples
+5. **Cross-mamba fusion**: Still the best fusion strategy, consistent with skeleton+IMU findings
+
+### What Didn't Work
+1. **Frozen ResNet18** (R3): ImageNet features too generic for action recognition, under-fits
+2. **Optical flow** (R8): Farnebäck flow adds noise rather than useful motion signal at 112×112 resolution
+3. **32 frames** (R7): Higher memory cost without benefit; 16 frames sufficient for UTD-MHAD actions
+4. **Batch size 32** (R8, R9): Consistently hurts — same finding as skeleton+IMU experiments
+5. **Full fine-tuning** (R6): Matches R4 but doesn't beat it; partial freeze is more efficient
+
+### Conclusion
+
+RGBD+IMU achieves **~0.90 accuracy** on UTD-MHAD, ~7 points below skeleton+IMU (0.96). This is a fundamental data limitation: 431 training samples cannot learn the noise-free pose abstraction that skeleton preprocessing provides. The RGBD pipeline is useful when skeleton preprocessing is unavailable, but skeleton remains strictly superior when accessible.
+
+## 7. Cross-Pipeline Comparison
+
+| Pipeline | Best Exp | Acc | F1 | Preprocessing Required |
+|----------|----------|-----|-----|----------------------|
+| **Skeleton + IMU** | Exp25 | **0.9628** | **0.9622** | Skeleton extraction (pose estimation) |
+| **RGBD + IMU** | R4 | 0.8977 | 0.8951 | None (raw video + depth + IMU) |
+
+### Training Commands
+
+**Best Skeleton+IMU (Exp25)**:
+```powershell
+python train/run_train.py --pipeline skel_imu --data_root "./datasets/UTD-MHAD" `
+  --epochs 100 --save_name skel_imu_exp25.pt --tb_dir runs --num_workers 0 `
+  --label_smoothing 0.1 --mixup_alpha 0.15 --weight_decay 0.008 `
+  --scheduler cosine_warmup --warmup_epochs 5 --lr 3e-4 --patience 40 --seed 42 `
+  --model_kwargs '{"d_model":160,"fusion":"cross_mamba","modality_dropout":0.0,"aux_weight":0.1}'
+```
+
+**Best RGBD+IMU (R4)**:
+```powershell
+python train/run_train.py --pipeline rgbd_imu --data_root "./datasets/UTD-MHAD" `
+  --epochs 100 --save_name rgbd_imu_R4.pt --tb_dir runs --num_workers 0 --batch_size 8 `
+  --label_smoothing 0.1 --mixup_alpha 0.15 --weight_decay 0.008 `
+  --scheduler cosine_warmup --warmup_epochs 5 --lr 3e-4 --patience 40 --seed 42 `
+  --model_kwargs '{"d_model":160,"fusion":"cross_mamba","aux_weight":0.1,"encoder":"pretrained","freeze":"partial","temporal_velocity":true}' `
+  --dataset_kwargs '{"augment":true}'
+```

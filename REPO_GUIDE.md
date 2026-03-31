@@ -8,7 +8,8 @@ Last Updated: 2025-07-20
 **核心方法:**
 - **Momentum Mamba (MMA):** 在 Mamba 选择性状态空间模型 (SSM) 中引入动量机制 (real / complex)，增强时序建模能力
 - **MMA-MMTSA:** 结合 Gramian Angular Field (GAF) 成像、时间段稀疏采样 (Temporal Segment Sampling) 与动量注意力融合
-- **Multimodal MMA (RGB-D + IMU):** 基于跨模态注意力的 Mamba 架构，融合 RGB-D 视频和 IMU 传感器数据
+- **Multimodal MMA (RGB-D + IMU):** 基于跨模态 Mamba 架构，融合 RGB-D 视频和 IMU 传感器数据，支持 PretrainedCNN (ResNet18) 和 SpatialCNN 编码器
+- **Multimodal MMA (Skeleton + IMU):** 基于跨模态 Mamba 架构，融合骨骼关节序列和 IMU 传感器数据 (**最佳方法: Acc=0.9628**)
 
 **关键特性:**
 - **统一训练 / 推理入口:** `train/run_train.py` + `infer/run_infer.py`，通过 Pipeline Registry 管理所有模型 (含 baseline)
@@ -45,9 +46,11 @@ COMP 4901D/
 │   ├── mma_utdmad.py                  # MomentumMambaHAR (纯 IMU)
 │   ├── mma_mmtsa.py                   # MMA_MMTSA (Depth + IMU/GAF)
 │   ├── mma_rgbd_imu.py                # MultimodalMMA (RGB-D + IMU)
+│   ├── mma_skel_imu.py                # MMA_SkeletonIMU (Skeleton + IMU) ★ Best
 │   └── backbones/
 │       ├── __init__.py
 │       ├── convnextv2.py              # ConvNeXt-V2 预训练编码器 (via timm)
+│       ├── pretrained_cnn.py          # PretrainedCNN (ResNet18, 4ch RGBD)
 │       ├── light_cnn.py               # ResBlock + LightCNN + SE 注意力
 │       └── spatial_cnn.py             # SpatialCNN (RGBD 空间特征)
 │
@@ -104,6 +107,7 @@ COMP 4901D/
 |-----------|---------------------|-------------------------|------------|--------------|
 | `utdmad`  | `MomentumMambaHAR`  | `UTDMADInertialDataset` | unpack     | logits       |
 | `mmtsa`   | `MMA_MMTSA`         | `UTD_MHAD_Dataset`      | unpack     | tuple_first  |
+| `skel_imu`| `MMA_SkeletonIMU`   | `UTDMADSkelIMUDataset`  | unpack     | logits       |
 | `rgbd_imu`| `MultimodalMMA`     | `UTDMADRGBDIMUDataset`  | unpack     | logits       |
 | `mumu`    | `MuMu`              | (user-provided)         | list       | mumu         |
 
@@ -275,11 +279,12 @@ tensorboard --logdir runs
 
 #### `model/backbones/` — 骨干网络子包
 - `ConvNeXtV2Encoder`: timm 预训练编码器，支持任意输入通道数、部分冻结
+- `PretrainedCNN`: ResNet18 预训练编码器，4 通道 RGBD 输入，支持 freeze="all"/"partial"/"none"
 - `LightCNN`: 4 层 Conv2D + SE 注意力
 - `SpatialCNN`: 4 层 stride-2 Conv2D (RGBD 帧)
 
 #### `model/encoders.py` — 复合编码器
-- `RGBDEncoder`: SpatialCNN/ConvNeXtV2 (per-frame) → MomentumMamba (temporal)
+- `RGBDEncoder`: SpatialCNN/PretrainedCNN/ConvNeXtV2 (per-frame) → [temporal_velocity] → MomentumMamba (temporal)
 - `IMUEncoder`: Conv1D/ConvNeXtV2-GAF → MomentumMamba (temporal)
 
 #### 模型类汇总
@@ -289,6 +294,7 @@ tensorboard --logdir runs
 | `MomentumMambaHAR` | ~321K | `(B, L, 6)` | `(B, 27)` logits |
 | `MMA_MMTSA` | ~4.3M | `(depth, imu)` | `(logits, aux_dict)` |
 | `MultimodalMMA` | ~1.4M | `(rgbd, imu)` | `(B, 27)` logits |
+| `MMA_SkeletonIMU` | ~450K | `(skel, imu)` | `(B, 27)` logits |
 | `MuMu` | ~448K | `[x_list]` | `(y_aux, y_target, alpha, attn)` |
 
 ### 数据集包 `datasets/`
@@ -404,12 +410,27 @@ IMU (T,6) → 归一化 ─────────────┘ → Multimoda
 
 ## Saved Checkpoints
 
-| 文件 | 管线 | 融合 | 动量 |
-|------|------|------|------|
-| `checkpoints/mma_mmtsa_best.pt` | mmtsa | attention | momentum |
-| `checkpoints/mma_rgbd_imu_attention_real_best.pt` | rgbd_imu | attention | real |
-| `checkpoints/mma_rgbd_imu_concat_real_best.pt` | rgbd_imu | concat | real |
-| `checkpoints/mma_rgbd_imu_gated_real_best.pt` | rgbd_imu | gated | real |
+| 文件 | 管线 | 融合 | Acc | 说明 |
+|------|------|------|-----|------|
+| `checkpoints/skel_imu_exp25.pt` | skel_imu | cross_mamba | **0.9628** | ★ 最佳模型 |
+| `checkpoints/rgbd_imu_R4.pt` | rgbd_imu | cross_mamba | 0.8977 | RGBD+IMU 最佳 |
+| `checkpoints/mma_mmtsa_best.pt` | mmtsa | attention | — | MMTSA 基线 |
+| `checkpoints/mma_rgbd_imu_attention_real_best.pt` | rgbd_imu | attention | — | 早期实验 |
+| `checkpoints/mma_rgbd_imu_concat_real_best.pt` | rgbd_imu | concat | — | 早期实验 |
+| `checkpoints/mma_rgbd_imu_gated_real_best.pt` | rgbd_imu | gated | — | 早期实验 |
+
+---
+
+## Best Results
+
+| Pipeline | Model | Best Acc | Best F1 | Key Config | Checkpoint |
+|----------|-------|----------|---------|------------|------------|
+| **Skeleton + IMU** | MMA_SkeletonIMU | **0.9628** | **0.9622** | cross_mamba, aux=0.1, d=160, bs=16, lr=3e-4 | `skel_imu_exp25.pt` |
+| RGBD + IMU | MultimodalMMA | 0.8977 | 0.8951 | ResNet18 partial, vel+aug, cross_mamba, aux=0.1, bs=8 | `rgbd_imu_R4.pt` |
+
+**推荐方法:** Skeleton+IMU (Exp25) — 通过 cross-mamba 融合 + 辅助损失实现 96.28% 准确率。若无法获取骨骼数据，RGBD+IMU (R4) 可达 89.77%。
+
+详细实验报告见 `experiment_report.md`。
 
 ---
 

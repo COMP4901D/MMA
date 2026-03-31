@@ -43,6 +43,8 @@ class UTDMADRGBDIMUDataset(Dataset):
         imu_as_gaf: bool = False,
         gaf_size: int = 64,
         modality_dropout: dict = None,
+        augment: bool = False,
+        use_flow: bool = False,
     ):
         super().__init__()
         self.n_frames = n_frames
@@ -51,6 +53,8 @@ class UTDMADRGBDIMUDataset(Dataset):
         self.depth_clip = depth_clip
         self.imu_as_gaf = imu_as_gaf
         self.gaf_size = gaf_size
+        self.augment = augment
+        self.use_flow = use_flow
 
         # Modality-loss simulation (training only)
         if modality_dropout is not None:
@@ -201,8 +205,11 @@ class UTDMADRGBDIMUDataset(Dataset):
         rgb_idx = self._uniform_sample(n_rgb, self.n_frames)
         dep_idx = self._uniform_sample(n_dep, self.n_frames)
 
-        out = np.empty((self.n_frames, 4, S, S), dtype=np.float32)
+        # Build RGBD-Flow: 4ch(RGBD) + 2ch(optical flow) = 6 channels
+        n_ch = 6 if self.use_flow else 4
+        out = np.empty((self.n_frames, n_ch, S, S), dtype=np.float32)
 
+        prev_gray = None
         for i in range(self.n_frames):
             rgb = (
                 cv2.resize(rgb_frames[rgb_idx[i]], (S, S)).astype(np.float32)
@@ -213,6 +220,24 @@ class UTDMADRGBDIMUDataset(Dataset):
             dep = cv2.resize(depth_frames[dep_idx[i]], (S, S))
             dep = np.clip(dep, 0, self.depth_clip) / self.depth_clip
             out[i, 3] = dep
+
+            if self.use_flow:
+                gray = cv2.cvtColor(
+                    (rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY
+                )
+                if prev_gray is not None:
+                    flow = cv2.calcOpticalFlowFarneback(
+                        prev_gray, gray, None,
+                        pyr_scale=0.5, levels=3, winsize=15,
+                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+                    )
+                    # Normalize flow to [-1, 1] (clamp at ±20 pixels)
+                    flow = np.clip(flow / 20.0, -1.0, 1.0)
+                    out[i, 4] = flow[:, :, 0]  # horizontal
+                    out[i, 5] = flow[:, :, 1]  # vertical
+                else:
+                    out[i, 4:6] = 0.0
+                prev_gray = gray
 
         return out
 
@@ -237,13 +262,21 @@ class UTDMADRGBDIMUDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        rgbd = self.rgbd_data[idx]  # (T, 4, H, W) float32 ndarray
+        rgbd = self.rgbd_data[idx].copy()  # (T, 4, H, W) float32 ndarray
+
+        # Training augmentation (applied consistently across all frames)
+        if self.augment:
+            rgbd = self._augment_rgbd(rgbd)
 
         imu = (self.imu_data[idx] - self.iner_mean) / self.iner_std
         if self.imu_as_gaf:
             imu = GAFEncoder.encode_multi(imu, self.gaf_size)
         else:
             imu = self._resample_1d(imu, self.max_imu_len)
+
+        # IMU augmentation (jitter + scaling, same as skeleton pipeline)
+        if self.augment:
+            imu = self._augment_imu(imu)
 
         # Apply modality dropout *before* converting to tensor
         if self.modality_dropout is not None:
@@ -254,3 +287,52 @@ class UTDMADRGBDIMUDataset(Dataset):
 
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return rgbd, imu, label
+
+    # --- Augmentation helpers ---
+
+    def _augment_rgbd(self, rgbd):
+        """Apply spatial augmentations consistently across all frames.
+
+        - Random horizontal flip (p=0.5)
+        - Random crop (scale 0.8-1.0) then resize back
+        - Color jitter on RGB channels only (brightness, contrast)
+        """
+        T, C, H, W = rgbd.shape
+
+        # Random horizontal flip
+        if self._rng.random() < 0.5:
+            rgbd = rgbd[:, :, :, ::-1].copy()
+            # Flip horizontal flow channel sign if present
+            if C >= 6:
+                rgbd[:, 4] = -rgbd[:, 4]
+
+        # Random crop: crop a subregion and resize back
+        scale = self._rng.uniform(0.8, 1.0)
+        crop_h, crop_w = int(H * scale), int(W * scale)
+        top = self._rng.integers(0, H - crop_h + 1)
+        left = self._rng.integers(0, W - crop_w + 1)
+        for i in range(T):
+            cropped = rgbd[i, :, top : top + crop_h, left : left + crop_w]
+            # Resize back: transpose to (H, W, C) for cv2, then back
+            cropped_hwc = cropped.transpose(1, 2, 0)
+            resized = cv2.resize(cropped_hwc, (W, H))
+            rgbd[i] = resized.transpose(2, 0, 1)
+
+        # Color jitter on RGB channels only (brightness + contrast)
+        brightness = self._rng.uniform(0.85, 1.15)
+        contrast = self._rng.uniform(0.85, 1.15)
+        rgbd[:, :3] = np.clip(
+            (rgbd[:, :3] - 0.5) * contrast + 0.5 + (brightness - 1.0),
+            0.0, 1.0,
+        )
+
+        return rgbd
+
+    def _augment_imu(self, imu):
+        """Apply jitter + scaling to IMU (mirrors skeleton pipeline)."""
+        # Jitter
+        imu = imu + self._rng.normal(0, 0.03, size=imu.shape).astype(np.float32)
+        # Scaling
+        scale = self._rng.normal(1.0, 0.1, size=(1, imu.shape[1])).astype(np.float32)
+        imu = imu * scale
+        return imu

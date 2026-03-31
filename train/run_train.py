@@ -95,7 +95,7 @@ PIPELINES = {
         "input_mode": "unpack",
         "output_mode": "logits",
         "trainer_module": "train.default_train",
-        "default_model_kwargs": {"fusion": "attention"},
+        "default_model_kwargs": {"fusion": "cross_mamba", "d_model": 160},
         "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
         "norm_keys": ["iner_mean", "iner_std"],
     },

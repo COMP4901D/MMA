@@ -13,7 +13,13 @@ from .mamba import MomentumMambaBlock
 
 
 class RGBDEncoder(nn.Module):
-    """SpatialCNN/ConvNeXtV2 per frame -> MomentumMamba temporal -> RMSNorm"""
+    """SpatialCNN/ConvNeXtV2/PretrainedCNN per frame -> MomentumMamba temporal -> RMSNorm
+
+    New options:
+      encoder="pretrained_cnn": ResNet18 pretrained on ImageNet (best for small datasets)
+      freeze="all"/"partial"/"none": freeze strategy for pretrained backbone
+      temporal_velocity=True: compute feature-level frame differences (mirrors skeleton velocity)
+    """
 
     def __init__(
         self,
@@ -30,17 +36,35 @@ class RGBDEncoder(nn.Module):
         encoder="spatial_cnn",
         convnext_model="convnextv2_atto",
         freeze_stages=3,
+        freeze="all",
+        temporal_velocity=False,
+        in_channels=4,
     ):
         super().__init__()
+        self.temporal_velocity = temporal_velocity
+
         if encoder == "convnextv2":
             from .backbones import ConvNeXtV2Encoder
             self.spatial = ConvNeXtV2Encoder(
-                in_channels=4, feat_dim=d_model,
+                in_channels=in_channels, feat_dim=d_model,
                 model_name=convnext_model, freeze_stages=freeze_stages,
+            )
+        elif encoder == "pretrained_cnn":
+            from .backbones import PretrainedCNN
+            self.spatial = PretrainedCNN(
+                in_channels=in_channels, d_model=d_model, freeze=freeze,
             )
         else:
             from .backbones import SpatialCNN
-            self.spatial = SpatialCNN(in_channels=4, d_model=d_model)
+            self.spatial = SpatialCNN(in_channels=in_channels, d_model=d_model)
+
+        # Temporal velocity: concat [feat, vel] -> project back to d_model
+        if temporal_velocity:
+            self.vel_proj = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU(),
+            )
 
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
@@ -58,7 +82,15 @@ class RGBDEncoder(nn.Module):
         """
         B, N, C, H, W = x.shape
         feat = self.spatial(x.reshape(B * N, C, H, W))
-        feat = self.drop(feat.reshape(B, N, -1))
+        feat = feat.reshape(B, N, -1)  # (B, N, d_model)
+
+        # Feature-level temporal velocity (mirrors skeleton velocity features)
+        if self.temporal_velocity:
+            vel = torch.zeros_like(feat)
+            vel[:, 1:] = feat[:, 1:] - feat[:, :-1]
+            feat = self.vel_proj(torch.cat([feat, vel], dim=-1))
+
+        feat = self.drop(feat)
         for blk in self.blocks:
             feat = blk(feat)
         return self.norm(feat)

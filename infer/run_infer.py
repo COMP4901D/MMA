@@ -276,6 +276,9 @@ def parse_args():
                    help="Use torch.compile for faster inference")
     p.add_argument("--vis_dir", type=str, default="",
                    help="Directory for evaluation plots (empty = off)")
+    p.add_argument("--tta", type=int, default=0,
+                   help="Test-Time Augmentation passes (0 = disabled). "
+                        "Averages logits over N augmented forward passes.")
 
     return p.parse_args()
 
@@ -422,6 +425,35 @@ def main():
         prec = results["prec"]
         rec = results["rec"]
         f1 = results["f1"]
+
+    # -- Test-Time Augmentation (TTA) --
+    if args.tta > 0 and not is_ensemble:
+        print(f"\nTTA: averaging over {args.tta} augmented passes...")
+        # Build augmented test dataset
+        tta_ds = create_test_dataset(
+            DatasetClass, data_key, args.data_root,
+            cfg.get("default_dataset_kwargs", {}),
+            user_ds_kw, norm_keys,
+        )
+        tta_ds.augment = True  # Enable augmentation
+        tta_loader = DataLoader(
+            tta_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+        )
+        # Collect logits from N augmented passes + 1 clean pass
+        tta_logits = [results["logits"]]  # clean pass
+        for i in range(args.tta):
+            res_i = do_evaluate(model, tta_loader, criterion, device, pipeline_cfg, infer_args)
+            tta_logits.append(res_i["logits"])
+        avg_logits = np.mean(tta_logits, axis=0)
+        preds = np.argmax(avg_logits, axis=1)
+        from sklearn.metrics import accuracy_score as _acc_score, \
+            precision_recall_fscore_support as _prf
+        acc = _acc_score(labels, preds)
+        prec, rec, f1, _ = _prf(labels, preds, average="weighted", zero_division=0)
+        results.update({"acc": acc, "prec": prec, "rec": rec, "f1": f1, "preds": preds})
+        print(f"  TTA Results: Acc={acc:.4f} F1={f1:.4f}")
+
     print(f"\nTest Results ({n} samples):")
     print(f"  Accuracy : {acc:.4f}")
     print(f"  Precision: {prec:.4f}")

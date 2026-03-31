@@ -389,11 +389,11 @@ Three improvements applied: (1) pretrained ResNet18 backbone, (2) temporal veloc
 
 ### 4.3 Phase 3: Additional Exploration (R7–R9)
 
-| Exp | Configuration | bs | Acc | Notes |
-|-----|---------------|-----|-----|-------|
-| R7 | R4 config + 32 frames | 4 | 0.8837 | OOM at epoch 51, more frames didn't help |
-| R8 | Optical flow (6ch) + vel + aug | 32 | 0.8791 | Flow didn't improve, bs=32 hurt |
-| R9 | SpatialCNN + vel + aug | 32 | 0.8558 | bs=32 clearly hurts convergence |
+| Exp | Configuration | bs | Acc | F1 | Notes |
+|-----|---------------|-----|-----|-----|-------|
+| R7 | R4 config + 32 frames | 4 | 0.8837 | 0.8791 | OOM at epoch 51, more frames didn't help |
+| R8 | Optical flow (6ch) + vel + aug | 32 | 0.8791 | 0.8710 | Farneback flow did not improve over plain RGBD |
+| R9 | SpatialCNN + vel + aug | 32 | 0.8558 | 0.8449 | bs=32 clearly hurts convergence |
 
 ## 5. RGBD+IMU Leaderboard
 
@@ -404,10 +404,10 @@ Three improvements applied: (1) pretrained ResNet18 backbone, (2) temporal veloc
 | 3 | R5 | SpatialCNN + vel + aug, bs=8 | 0.8953 | 0.8929 |
 | 4 | R1 | SpatialCNN + cross_mamba, bs=8 | 0.8930 | 0.8882 |
 | 5 | R3 | ResNet18 frozen + vel + aug, bs=8 | 0.8860 | 0.8819 |
-| 6 | R7 | R4 + 32 frames, bs=4 | 0.8837 | — |
-| 7 | R8 | Flow (6ch) + vel + aug, bs=32 | 0.8791 | — |
+| 6 | R7 | R4 + 32 frames, bs=4 | 0.8837 | 0.8791 |
+| 7 | R8 | Flow (6ch) + vel + aug, bs=32 | 0.8791 | 0.8710 |
 | 8 | R2 | SpatialCNN + attention, bs=8 | 0.8767 | 0.8711 |
-| 9 | R9 | SpatialCNN + vel + aug, bs=32 | 0.8558 | — |
+| 9 | R9 | SpatialCNN + vel + aug, bs=32 | 0.8558 | 0.8449 |
 
 ## 6. Key Findings
 
@@ -618,14 +618,50 @@ Training trajectory highlights:
 
 ## 4. Comprehensive Comparison
 
-| Exp | Method | Full | RGBD-only | IMU-only | Avg | Degradation |
-|-----|--------|------|-----------|----------|-----|-------------|
-| R4 | No robustness training | 0.8977 | 0.1419 | 0.7302 | 0.5900 | 0.7558 |
-| MD4 | Dataset-level curriculum MD | 0.8930 | 0.3558 | 0.8767 | 0.7085 | 0.5372 |
-| MD2 | Dataset-level curriculum + missing_token | 0.8884 | 0.3698 | 0.8488 | 0.7023 | 0.5186 |
-| MDdrop1 | Feature-level drop (imu=0.20) | 0.8860 | 0.3465 | 0.8488 | 0.6938 | 0.5395 |
-| ST1 | Staged training | 0.8279 | 0.0279 | 0.7488 | 0.5349 | 0.8000 |
-| **CMAR1** | **Feature-level drop (imu=0.35) + CMAR** | **0.9093** | **0.4163** | **0.8628** | **0.7295** | **0.4930** |
+### 4.1 Missing-Modality Robustness Summary
+
+| Exp | Method | Full Acc | Full F1 | RGBD-only Acc | RGBD-only F1 | IMU-only Acc | IMU-only F1 | Avg Acc | Degradation |
+|-----|--------|----------|---------|---------------|--------------|--------------|-------------|---------|-------------|
+| R4 | No robustness training | 0.8977 | 0.8951 | 0.1419 | 0.0987 | 0.7302 | 0.7030 | 0.5900 | 0.7558 |
+| MD2 | Dataset-level curriculum + missing token | 0.8884 | — | 0.3698 | — | 0.8488 | — | 0.7023 | 0.5186 |
+| MD4 | Dataset-level curriculum MD | 0.8930 | — | 0.3558 | — | 0.8767 | — | 0.7085 | 0.5372 |
+| ST1 | Staged training | 0.8279 | 0.8165 | 0.0279 | — | 0.7488 | — | 0.5349 | 0.8000 |
+| MDdrop1 | Feature-level drop (imu=0.20) | 0.8860 | 0.8805 | 0.3465 | 0.3181 | 0.8488 | 0.8430 | 0.6938 | 0.5395 |
+| **CMAR1** | **Feature drop (imu=0.35) + CMAR(0.1)** | **0.9093** | **0.9061** | **0.4163** | **0.4072** | **0.8628** | **0.8599** | **0.7295** | **0.4930** |
+| CMAR2 | Feature drop (imu=0.45) + CMAR(0.1) | 0.8744 | 0.8702 | 0.3395 | 0.2934 | 0.7953 | 0.7884 | 0.6698 | 0.5349 |
+| CMAR3 | Feature drop (imu=0.35) + CMAR(0.3) | 0.8860 | 0.8823 | 0.4512 | 0.4516 | 0.8651 | 0.8612 | 0.7341 | 0.4349 |
+| CMAR4 | Feature drop (imu=0.45) + CMAR(0.3) | 0.8907 | 0.8864 | 0.3674 | 0.3386 | 0.8581 | 0.8563 | 0.7054 | 0.5233 |
+| CMAR5 | Feature drop (imu=0.50, rgbd=0.05) + CMAR(0.1) | 0.9070 | 0.9046 | 0.4860 | 0.4830 | 0.7930 | 0.7745 | 0.7287 | 0.4209 |
+| CMAR6 | Feature drop + CMAR proj=128 | 0.8791 | 0.8683 | 0.3698 | 0.3573 | 0.8372 | 0.8247 | 0.6953 | 0.5093 |
+| CMAR7 | Feature drop + CMAR + aux=0.3 | 0.8860 | 0.8820 | 0.3837 | 0.3610 | 0.8302 | 0.8211 | 0.7000 | 0.5023 |
+| CMAR8 | Feature drop (imu=0.45, rgbd=0.05) + CMAR(0.3) | 0.8953 | 0.8934 | 0.4186 | 0.3907 | 0.8395 | 0.8342 | 0.7178 | 0.4767 |
+| CMAR9 | Feature drop (imu=0.50) + CMAR(0.2) | 0.8791 | 0.8770 | 0.4116 | 0.4020 | 0.8419 | 0.8421 | 0.7109 | 0.4674 |
+
+Key takeaways from the CMAR sweep:
+- **Best overall Full accuracy** remains **CMAR1**: 0.9093 / 0.9061.
+- **Best RGBD-only** is now **CMAR5**: 0.4860 / 0.4830, the closest result so far to the 0.50 target.
+- **Best balanced robustness** is **CMAR3** by average accuracy: 0.7341, with the strongest overall trade-off across full / RGBD-only / IMU-only.
+- The strongest recurring pattern is **high IMU dropout + low RGBD dropout**: pushing `md_drop_imu` to 0.50 and reducing `md_drop_rgbd` to 0.05 helps RGBD-only most.
+- Increasing `cmar_weight` to 0.3 helps balance when IMU dropout stays moderate (CMAR3), but combining high IMU dropout with strong CMAR can over-regularize (CMAR4).
+- Larger `cmar_proj_dim` and larger `aux_weight` did not help.
+
+### 4.2 Cross-Method Summary (Full-Set Accuracy/F1)
+
+This table compares the main RGBD+IMU method families beyond the robustness section, including motion-specific variants and the MuMu baseline.
+
+| Family | Exp | Method | Acc | F1 | Notes |
+|--------|-----|--------|-----|-----|-------|
+| Baseline RGBD+IMU | R4 | ResNet18 partial + velocity + augmentation | 0.8977 | 0.8951 | Best non-robust RGBD+IMU baseline |
+| Optical flow | R8 | RGBD + Farneback flow (6-channel) | 0.8791 | 0.8710 | Worse than plain RGBD; added noise and required larger batch |
+| Frame difference | FD1 | Input-level frame diff channels | 0.8791 | 0.8744 | Better than optical flow, still below R4 |
+| Temporal diff | FD4 | Feature-level additive temporal diff | 0.8581 | 0.8497 | Clearly harmful |
+| Temporal diff | FD5 | Feature-level gated temporal diff | 0.8698 | 0.8627 | Better than additive diff, still below R4 |
+| Robust training | MD4 | Dataset-level curriculum modality dropout | 0.8930 | — | Strong IMU-only, moderate RGBD-only |
+| Robust training | CMAR1 | Feature-level dropout + CMAR | 0.9093 | 0.9061 | Best overall robust model |
+| Robust training | CMAR5 | High IMU-drop + low RGBD-drop + CMAR | 0.9070 | 0.9046 | Best RGBD-only so far |
+| Baseline comparison | MuMu RGBD+IMU | Cooperative multitask fusion baseline | 0.6116 | 0.5897 | Substantially weaker than MMA |
+
+The motion-specific conclusion is now clear: **optical flow and frame-difference style augmentations did not beat the plain RGBD baseline**, and the only interventions that materially improved robustness were **modality dropout** and **CMAR**.
 
 ---
 
@@ -668,18 +704,27 @@ The net result: CMAR1's RGBD branch is strong enough that combining both modalit
 
 ---
 
-## 6. Leaderboard (RGBD+IMU All Experiments)
+## 6. Leaderboard (RGBD+IMU Robustness)
 
-| Rank | Exp | Full | RGBD-only | IMU-only | Avg | F1 |
-|------|-----|------|-----------|----------|-----|----|
-| 🥇 | **CMAR1** | **0.9093** | **0.4163** | **0.8628** | **0.7295** | 0.9061 |
-| 🥈 | R4 (no robust) | 0.8977 | 0.1419 | 0.7302 | 0.5900 | 0.8951 |
-| 🥉 | MD4 | 0.8930 | 0.3558 | 0.8767 | 0.7085 | — |
-| 4 | MD2 | 0.8884 | 0.3698 | 0.8488 | 0.7023 | — |
-| 5 | MDdrop1 | 0.8860 | 0.3465 | 0.8488 | 0.6938 | 0.8805 |
-| 6 | MD6 | 0.8791 | 0.3023 | 0.8395 | 0.6736 | — |
-| 7 | MD1 | 0.8860 | 0.2163 | 0.8256 | 0.6426 | — |
-| 8 | ST1 | 0.8279 | 0.0279 | 0.7488 | 0.5349 | 0.8165 |
+### 6.1 Best by Full Accuracy
+
+| Rank | Exp | Full | F1 | RGBD-only | IMU-only | Avg |
+|------|-----|------|----|-----------|----------|-----|
+| 🥇 | **CMAR1** | **0.9093** | **0.9061** | 0.4163 | 0.8628 | 0.7295 |
+| 🥈 | CMAR5 | 0.9070 | 0.9046 | **0.4860** | 0.7930 | 0.7287 |
+| 🥉 | R4 (no robust) | 0.8977 | 0.8951 | 0.1419 | 0.7302 | 0.5900 |
+| 4 | CMAR8 | 0.8953 | 0.8934 | 0.4186 | 0.8395 | 0.7178 |
+| 5 | MD4 | 0.8930 | — | 0.3558 | **0.8767** | 0.7085 |
+
+### 6.2 Best by RGBD-only Accuracy
+
+| Rank | Exp | RGBD-only | Full | Avg | Note |
+|------|-----|-----------|------|-----|------|
+| 🥇 | **CMAR5** | **0.4860** | 0.9070 | 0.7287 | Closest to 0.50 target |
+| 🥈 | CMAR3 | 0.4512 | 0.8860 | **0.7341** | Best balanced robustness |
+| 🥉 | CMAR8 | 0.4186 | 0.8953 | 0.7178 | Strong secondary option |
+| 4 | CMAR1 | 0.4163 | **0.9093** | 0.7295 | Best overall full performance |
+| 5 | CMAR9 | 0.4116 | 0.8791 | 0.7109 | Moderate gain, weaker full |
 
 ---
 

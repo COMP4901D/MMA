@@ -77,11 +77,22 @@ def mixup_forward(model, batch, device, cfg, criterion, alpha):
     # Auxiliary multi-task loss in mixup path
     base_model = model.module if hasattr(model, 'module') else model
     if hasattr(base_model, '_aux_logits') and base_model._aux_logits is not None:
-        aux_skel, aux_imu = base_model._aux_logits
-        aux_loss_1 = lam * criterion(aux_skel, labels) + (1 - lam) * criterion(aux_skel, labels[perm])
-        aux_loss_2 = lam * criterion(aux_imu, labels) + (1 - lam) * criterion(aux_imu, labels[perm])
-        loss = loss + base_model.aux_weight * (aux_loss_1 + aux_loss_2) / 2
+        aux_a, aux_b = base_model._aux_logits
+        n_aux, aux_sum = 0, 0.0
+        if aux_a is not None:
+            aux_sum = aux_sum + lam * criterion(aux_a, labels) + (1 - lam) * criterion(aux_a, labels[perm])
+            n_aux += 1
+        if aux_b is not None:
+            aux_sum = aux_sum + lam * criterion(aux_b, labels) + (1 - lam) * criterion(aux_b, labels[perm])
+            n_aux += 1
+        if n_aux > 0:
+            loss = loss + base_model.aux_weight * aux_sum / n_aux
         base_model._aux_logits = None
+
+    # CMAR loss (cross-modal alignment regularization)
+    if hasattr(base_model, '_cmar_loss') and base_model._cmar_loss is not None:
+        loss = loss + base_model.cmar_weight * base_model._cmar_loss
+        base_model._cmar_loss = None
 
     return loss, logits, labels, lam, perm
 
@@ -108,17 +119,38 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg, args):
                 )
             else:
                 output, labels = model_forward(model, batch, device, cfg)
-                logits = extract_logits(output, cfg)
-                loss = criterion(logits, labels)
+
+                # Simultaneous modality dropout: output is a dict
+                if isinstance(output, dict):
+                    logits = output["logits"]
+                    loss = criterion(logits, labels)
+                    md_lam = output["md_lambda"]
+                    loss = loss + md_lam * criterion(output["logits_rgbd_only"], labels)
+                    loss = loss + md_lam * criterion(output["logits_imu_only"], labels)
+                else:
+                    logits = extract_logits(output, cfg)
+                    loss = criterion(logits, labels)
                 lam, perm = 1.0, None
 
         # Auxiliary multi-task loss (per-modality heads)
         base_model = model.module if hasattr(model, 'module') else model
         if hasattr(base_model, '_aux_logits') and base_model._aux_logits is not None:
-            aux_skel, aux_imu = base_model._aux_logits
-            aux_loss = (criterion(aux_skel, labels) + criterion(aux_imu, labels)) / 2
-            loss = loss + base_model.aux_weight * aux_loss
+            aux_a, aux_b = base_model._aux_logits
+            n_aux, aux_sum = 0, 0.0
+            if aux_a is not None:
+                aux_sum = aux_sum + criterion(aux_a, labels)
+                n_aux += 1
+            if aux_b is not None:
+                aux_sum = aux_sum + criterion(aux_b, labels)
+                n_aux += 1
+            if n_aux > 0:
+                loss = loss + base_model.aux_weight * aux_sum / n_aux
             base_model._aux_logits = None
+
+        # CMAR loss (cross-modal alignment regularization)
+        if hasattr(base_model, '_cmar_loss') and base_model._cmar_loss is not None:
+            loss = loss + base_model.cmar_weight * base_model._cmar_loss
+            base_model._cmar_loss = None
 
         scaler.scale(loss).backward()
         if args.clip_grad > 0:

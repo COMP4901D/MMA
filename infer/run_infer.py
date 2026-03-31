@@ -110,6 +110,22 @@ PIPELINES = {
         "default_trainer_kwargs": {"beta_aux": 0.5},
         "norm_keys": ["mean", "std"],
     },
+    "mumu_rgbd_imu": {
+        "model_module": "baselines.MuMu.MuMu_rgbd_imu",
+        "model_class": "MuMuRGBDIMU",
+        "dataset_module": "datasets.utd_rgbd_imu",
+        "dataset_class": "UTDMADRGBDIMUDataset",
+        "data_key": "data_dir",
+        "input_mode": "unpack",
+        "output_mode": "mumu",
+        "trainer_module": "train.mumu_train",
+        "default_model_kwargs": {
+            "feature_dim": 128, "cnn_d_model": 128, "freeze": "partial",
+        },
+        "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
+        "default_trainer_kwargs": {"beta_aux": 0.5},
+        "norm_keys": ["iner_mean", "iner_std"],
+    },
     "skel_imu": {
         "model_module": "model.mma_skel_imu",
         "model_class": "MMA_SkeletonIMU",
@@ -279,8 +295,94 @@ def parse_args():
     p.add_argument("--tta", type=int, default=0,
                    help="Test-Time Augmentation passes (0 = disabled). "
                         "Averages logits over N augmented forward passes.")
+    p.add_argument("--eval_missing", type=str, default="none",
+                   choices=["none", "rgbd", "imu", "all"],
+                   help="Evaluate with missing modality: none=full, "
+                        "rgbd=drop RGBD, imu=drop IMU, all=run 3 evaluations")
 
     return p.parse_args()
+
+
+# ================================================================
+#  Missing-modality evaluation
+# ================================================================
+
+@torch.no_grad()
+def _eval_missing_condition(model, loader, device, condition):
+    """Evaluate with a specific missing-modality condition.
+    condition: "full", "rgbd_only", "imu_only"
+    """
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+    model.eval()
+    all_preds, all_labels = [], []
+    use_amp = (device.type == "cuda")
+    for batch in loader:
+        batch = [b.to(device) for b in batch]
+        labels = batch[-1]
+        rgbd, imu = batch[0], batch[1]
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            if condition == "rgbd_only":
+                logits = model(rgbd, None)
+            elif condition == "imu_only":
+                logits = model(None, imu)
+            else:
+                logits = model(rgbd, imu)
+        # Handle dict output (simultaneous mode at eval — shouldn't happen, but be safe)
+        if isinstance(logits, dict):
+            logits = logits["logits"]
+        elif isinstance(logits, (tuple, list)):
+            logits = logits[1]  # MuMu: (y_aux, y_target, alpha, attn)
+        all_preds.append(logits.float().cpu().argmax(1).numpy())
+        all_labels.append(labels.cpu().numpy())
+    preds = np.concatenate(all_preds)
+    labels = np.concatenate(all_labels)
+    acc = accuracy_score(labels, preds)
+    _, _, f1, _ = precision_recall_fscore_support(
+        labels, preds, average="weighted", zero_division=0)
+    return acc, f1, preds, labels
+
+
+def _eval_missing(model, loader, criterion, device, pipeline_cfg,
+                  infer_args, args, full_results):
+    """Run missing-modality evaluation and print summary table."""
+    conditions = []
+    if args.eval_missing in ("none",):
+        return
+    if args.eval_missing == "all":
+        conditions = ["full", "rgbd_only", "imu_only"]
+    elif args.eval_missing == "rgbd":
+        conditions = ["rgbd_only"]
+    elif args.eval_missing == "imu":
+        conditions = ["imu_only"]
+
+    results_table = {}
+    for cond in conditions:
+        if cond == "full":
+            results_table[cond] = (full_results["acc"], full_results["f1"])
+        else:
+            acc, f1, _, _ = _eval_missing_condition(model, loader, device, cond)
+            results_table[cond] = (acc, f1)
+
+    # Print table
+    print(f"\n{'='*60}")
+    print(f"Missing-Modality Evaluation")
+    print(f"{'='*60}")
+    print(f"{'Condition':<20} {'Accuracy':>10} {'F1':>10}")
+    print(f"{'-'*40}")
+    for cond in conditions:
+        acc, f1 = results_table[cond]
+        label = {"full": "Full (both)", "rgbd_only": "RGBD-only",
+                 "imu_only": "IMU-only"}.get(cond, cond)
+        print(f"{label:<20} {acc:>10.4f} {f1:>10.4f}")
+    if len(results_table) == 3:
+        avg_acc = sum(v[0] for v in results_table.values()) / 3
+        avg_f1 = sum(v[1] for v in results_table.values()) / 3
+        min_acc = min(v[0] for k, v in results_table.items() if k != "full")
+        degradation = results_table["full"][0] - min_acc
+        print(f"{'-'*40}")
+        print(f"{'Average':<20} {avg_acc:>10.4f} {avg_f1:>10.4f}")
+        print(f"{'Degradation':<20} {degradation:>10.4f}")
+    print(f"{'='*60}")
 
 
 # ================================================================
@@ -322,9 +424,9 @@ def main():
     ModelClass = import_class(model_module, model_class_name)
     DatasetClass = import_class(dataset_module, dataset_class_name)
 
-    # -- Merge kwargs: checkpoint saved < registry defaults < CLI --
-    model_kwargs = ckpt.get("model_kwargs", {}).copy()
-    model_kwargs.update(cfg.get("default_model_kwargs", {}))
+    # -- Merge kwargs: registry defaults < checkpoint saved < CLI --
+    model_kwargs = cfg.get("default_model_kwargs", {}).copy()
+    model_kwargs.update(ckpt.get("model_kwargs", {}))
     model_kwargs.update(parse_json_kwargs(args.model_kwargs))
 
     user_ds_kw = parse_json_kwargs(args.dataset_kwargs)
@@ -340,7 +442,7 @@ def main():
     model = ModelClass(**model_kwargs).to(device)
 
     state = ckpt.get("model_state") or ckpt.get("state_dict") or ckpt
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
 
     # -- torch.compile --
@@ -453,6 +555,12 @@ def main():
         prec, rec, f1, _ = _prf(labels, preds, average="weighted", zero_division=0)
         results.update({"acc": acc, "prec": prec, "rec": rec, "f1": f1, "preds": preds})
         print(f"  TTA Results: Acc={acc:.4f} F1={f1:.4f}")
+
+    # -- Missing-modality evaluation --
+    if args.eval_missing != "none" and not is_ensemble:
+        _eval_missing(model, test_loader, criterion, device, pipeline_cfg,
+                      infer_args, args, results)
+        return
 
     print(f"\nTest Results ({n} samples):")
     print(f"  Accuracy : {acc:.4f}")

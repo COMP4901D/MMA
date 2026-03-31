@@ -7,6 +7,7 @@ IMUEncoder:  Conv1D frontend  or  ConvNeXtV2 (GAF images) + MomentumMamba
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .layers import RMSNorm
 from .mamba import MomentumMambaBlock
@@ -19,6 +20,9 @@ class RGBDEncoder(nn.Module):
       encoder="pretrained_cnn": ResNet18 pretrained on ImageNet (best for small datasets)
       freeze="all"/"partial"/"none": freeze strategy for pretrained backbone
       temporal_velocity=True: compute feature-level frame differences (mirrors skeleton velocity)
+      temporal_diff_mode="none"/"add"/"gate": feature-level temporal difference with learnable fusion
+      use_frame_diff=True: input has extra diff channels (8ch instead of 4ch)
+      diff_channels="all"/"rgb_only"/"depth_only": which diff channels are present
     """
 
     def __init__(
@@ -39,24 +43,38 @@ class RGBDEncoder(nn.Module):
         freeze="all",
         temporal_velocity=False,
         in_channels=4,
+        temporal_diff_mode="none",
+        use_frame_diff=False,
+        diff_channels="all",
     ):
         super().__init__()
         self.temporal_velocity = temporal_velocity
+        self.temporal_diff_mode = temporal_diff_mode
+
+        # Determine actual input channels based on frame diff config
+        actual_in_channels = in_channels
+        if use_frame_diff:
+            if diff_channels == "all":
+                actual_in_channels = in_channels + 4   # +ΔRGBD
+            elif diff_channels == "rgb_only":
+                actual_in_channels = in_channels + 3   # +ΔRGB
+            elif diff_channels == "depth_only":
+                actual_in_channels = in_channels + 1   # +ΔD
 
         if encoder == "convnextv2":
             from .backbones import ConvNeXtV2Encoder
             self.spatial = ConvNeXtV2Encoder(
-                in_channels=in_channels, feat_dim=d_model,
+                in_channels=actual_in_channels, feat_dim=d_model,
                 model_name=convnext_model, freeze_stages=freeze_stages,
             )
         elif encoder == "pretrained_cnn":
             from .backbones import PretrainedCNN
             self.spatial = PretrainedCNN(
-                in_channels=in_channels, d_model=d_model, freeze=freeze,
+                in_channels=actual_in_channels, d_model=d_model, freeze=freeze,
             )
         else:
             from .backbones import SpatialCNN
-            self.spatial = SpatialCNN(in_channels=in_channels, d_model=d_model)
+            self.spatial = SpatialCNN(in_channels=actual_in_channels, d_model=d_model)
 
         # Temporal velocity: concat [feat, vel] -> project back to d_model
         if temporal_velocity:
@@ -64,6 +82,24 @@ class RGBDEncoder(nn.Module):
                 nn.Linear(d_model * 2, d_model),
                 nn.LayerNorm(d_model),
                 nn.ReLU(),
+            )
+
+        # Feature-level temporal difference modules (bottleneck design)
+        if temporal_diff_mode in ("add", "gate"):
+            bottleneck = d_model // 4
+            self.motion_net = nn.Sequential(
+                nn.Linear(d_model, bottleneck),
+                nn.ReLU(),
+                nn.Linear(bottleneck, d_model),
+            )
+        if temporal_diff_mode == "add":
+            self.motion_scale = nn.Parameter(torch.tensor(0.1))
+        elif temporal_diff_mode == "gate":
+            self.motion_gate = nn.Sequential(
+                nn.Linear(d_model * 2, bottleneck),
+                nn.ReLU(),
+                nn.Linear(bottleneck, d_model),
+                nn.Sigmoid(),
             )
 
         self.drop = nn.Dropout(dropout)
@@ -78,11 +114,26 @@ class RGBDEncoder(nn.Module):
 
     def forward(self, x):
         """
-        x: (B, N_frames, 4, H, W) -> (B, N_frames, d_model)
+        x: (B, N_frames, C, H, W) -> (B, N_frames, d_model)
+        C depends on use_frame_diff: 4 (default), 5/7/8 (with diff channels)
         """
         B, N, C, H, W = x.shape
         feat = self.spatial(x.reshape(B * N, C, H, W))
         feat = feat.reshape(B, N, -1)  # (B, N, d_model)
+
+        # Feature-level temporal difference (Approach B)
+        if self.temporal_diff_mode in ("add", "gate"):
+            feat_diff = torch.zeros_like(feat)
+            feat_diff[:, 1:] = feat[:, 1:] - feat[:, :-1]
+            # First frame: forward difference (same as second frame's diff)
+            if N > 1:
+                feat_diff[:, 0] = feat_diff[:, 1]
+            motion_feat = self.motion_net(feat_diff)
+            if self.temporal_diff_mode == "add":
+                feat = feat + self.motion_scale * motion_feat
+            else:  # gate
+                gate = self.motion_gate(torch.cat([feat, motion_feat], dim=-1))
+                feat = feat + gate * motion_feat
 
         # Feature-level temporal velocity (mirrors skeleton velocity features)
         if self.temporal_velocity:

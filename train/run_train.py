@@ -99,6 +99,29 @@ PIPELINES = {
         "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
         "norm_keys": ["iner_mean", "iner_std"],
     },
+    "staged_rgbd_imu": {
+        "model_module": "model.mma_rgbd_imu",
+        "model_class": "MultimodalMMA",
+        "dataset_module": "datasets.utd_rgbd_imu",
+        "dataset_class": "UTDMADRGBDIMUDataset",
+        "data_key": "data_dir",
+        "input_mode": "unpack",
+        "output_mode": "logits",
+        "trainer_module": "train.staged_train",
+        "default_model_kwargs": {"fusion": "cross_mamba", "d_model": 128,
+                                  "aux_weight": 0.3, "dropout": 0.4,
+                                  "encoder": "pretrained", "freeze": "partial",
+                                  "temporal_velocity": True,
+                                  "md_schedule": "none"},
+        "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
+        "default_trainer_kwargs": {
+            "phase1_end": 20, "phase2_end": 40,
+            "phase1_lr": 3e-4, "phase2_lr": 1e-4, "phase3_lr": 3e-4,
+            "phase2_aux_weight": 0.3, "phase3_aux_weight": 0.3,
+            "phase3_rgbd_lr_scale": 0.1, "staged_warmup_epochs": 5,
+        },
+        "norm_keys": ["iner_mean", "iner_std"],
+    },
     "mumu": {
         "model_module": "baselines.MuMu.MuMu",
         "model_class": "MuMu",
@@ -115,6 +138,22 @@ PIPELINES = {
         "default_dataset_kwargs": {"max_len": 256},
         "default_trainer_kwargs": {"beta_aux": 0.5},
         "norm_keys": ["mean", "std"],
+    },
+    "mumu_rgbd_imu": {
+        "model_module": "baselines.MuMu.MuMu_rgbd_imu",
+        "model_class": "MuMuRGBDIMU",
+        "dataset_module": "datasets.utd_rgbd_imu",
+        "dataset_class": "UTDMADRGBDIMUDataset",
+        "data_key": "data_dir",
+        "input_mode": "unpack",
+        "output_mode": "mumu",
+        "trainer_module": "train.mumu_train",
+        "default_model_kwargs": {
+            "feature_dim": 128, "cnn_d_model": 128, "freeze": "partial",
+        },
+        "default_dataset_kwargs": {"n_frames": 16, "frame_size": 112, "max_imu_len": 128},
+        "default_trainer_kwargs": {"beta_aux": 0.5},
+        "norm_keys": ["iner_mean", "iner_std"],
     },
     "skel_imu": {
         "model_module": "model.mma_skel_imu",
@@ -493,6 +532,9 @@ def main():
     trainer_kwargs.update(parse_json_kwargs(args.trainer_kwargs))
     criterion = get_criterion(args, **trainer_kwargs)
 
+    # Merge trainer kwargs into pipeline_cfg so custom trainers can access them
+    pipeline_cfg.update(trainer_kwargs)
+
     # -- Resume --
     start_epoch = 0
     best_metric = 0.0
@@ -530,6 +572,12 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+
+        # Set epoch info for modality dropout schedule
+        base_model = model.module if hasattr(model, 'module') else model
+        if hasattr(base_model, 'current_epoch'):
+            base_model.current_epoch = epoch
+            base_model.total_epochs = args.epochs
 
         tr_loss, tr_acc = do_train_epoch(
             model, train_loader, optimizer, criterion, device,
@@ -595,6 +643,8 @@ def main():
             tb_writer.add_scalar("Accuracy/val", val_acc, epoch + 1)
             tb_writer.add_scalar("F1/val", val_f1, epoch + 1)
             tb_writer.add_scalar("LR", current_lr, epoch + 1)
+            if hasattr(base_model, 'get_md_prob'):
+                tb_writer.add_scalar("MD_prob", base_model.get_md_prob(), epoch + 1)
 
         # Early stopping
         if args.patience > 0 and no_improve >= args.patience:

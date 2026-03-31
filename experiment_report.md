@@ -470,3 +470,245 @@ python train/run_train.py --pipeline rgbd_imu --data_root "./datasets/UTD-MHAD" 
   --model_kwargs '{"d_model":160,"fusion":"cross_mamba","aux_weight":0.1,"encoder":"pretrained","freeze":"partial","temporal_velocity":true}' `
   --dataset_kwargs '{"augment":true}'
 ```
+
+---
+---
+
+# MMA RGBD+IMU — Missing-Modality Robustness Experiments
+
+## 1. Motivation
+
+Deploying a multimodal model in the real world requires **graceful degradation** when one sensor fails or is unavailable. After establishing the R4 baseline (Full=0.8977), we discovered a critical weakness: with **no robustness training**, zeroing out one modality at inference time causes catastrophic failure:
+
+- R4 RGBD-only: **14.19%** (barely above random-27 = 3.7%)
+- R4 IMU-only: **73.02%**
+
+The RGBD branch effectively acts as a bias term that the model has never learned to use independently. This section documents the systematic effort to fix this, culminating in CMAR1 — the best model overall.
+
+---
+
+## 2. New Architecture Components
+
+### 2.1 Modality Dropout (Dataset-level, MD1–MD6)
+
+Applied at the **data loading level**: entire modality inputs replaced with zero tensors or learnable missing tokens before the forward pass.
+
+**Schedules:**
+- `fixed`: constant dropout probability $p$ throughout training
+- `curriculum`: warmup phase (no dropout) then linear ramp to $p_{max}$ over remaining epochs
+- `simultaneous`: every iteration runs 3 forward passes (full, RGBD-only, IMU-only) and sums their losses
+
+**Missing token variants:**
+- `zero-fill`: replace missing modality input with all zeros
+- `missing_token`: replace with a learnable `nn.Parameter` of shape `(1, 1, d_model)` (broadcast over batch/time)
+
+### 2.2 Feature-level Modality Dropout (MD-Drop)
+
+Applied **after encoding, before fusion** inside `MultimodalMMA.forward()`:
+
+```python
+# In forward(), after fv = rgbd_enc(rgbd), fi = imu_enc(imu)
+r = random.random()
+if r < md_drop_imu:
+    fi = torch.zeros_like(fi)          # RGBD-only path (35% of batches)
+elif r < md_drop_imu + md_drop_rgbd:
+    fv = torch.zeros_like(fv)          # IMU-only path (10% of batches)
+# else: both modalities (55% of batches)
+```
+
+Key difference from dataset-level dropout: encoders always run (preventing gradient starvation in early layers), but the fusion module and classifier must learn to handle zero features.
+
+### 2.3 Cross-Modal Alignment Regularization (CMAR)
+
+Additional loss term that forces both branch representations to be mutually consistent:
+
+$$\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{aux} \cdot \mathcal{L}_{aux} + \lambda_{cmar} \cdot \underbrace{\| \text{Proj}_{rgbd}(\bar{h}^{rgbd}) - \text{Proj}_{imu}(\bar{h}^{imu}) \|_F^2}_{\mathcal{L}_{CMAR}}$$
+
+Where $\bar{h} = \text{MeanPool}_{t}(h_t)$ pools over the sequence dimension to handle different RGBD/IMU sequence lengths.
+
+**Implementation:**
+```python
+# Two projection heads in __init__:
+self.cmar_proj_rgbd = nn.Linear(d_model, cmar_proj_dim)  # 160 → 64
+self.cmar_proj_imu  = nn.Linear(d_model, cmar_proj_dim)  # 160 → 64
+
+# In forward(), before fusion:
+fv_proj = self.cmar_proj_rgbd(fv.mean(dim=1))   # (B, 64)
+fi_proj = self.cmar_proj_imu(fi.mean(dim=1))    # (B, 64)
+self._cmar_loss = torch.mean((fv_proj - fi_proj) ** 2)
+# Trainer adds: loss += cmar_weight * _cmar_loss
+```
+
+The projection heads isolate CMAR from the main task — the main feature space is free to diverge as needed for classification, while alignment is enforced only in the 64-dim projection space.
+
+---
+
+## 3. Experiment Results
+
+All experiments use the proven base config: d_model=160, fusion=cross_mamba, aux_weight=0.1, encoder=pretrained, freeze=partial, temporal_velocity=true, augment=true, bs=32, label_smoothing=0.1, mixup_alpha=0.15, weight_decay=0.008, cosine_warmup(5), lr=3e-4, patience=40, seed=42.
+
+### 3.1 Dataset-level Modality Dropout (MD1–MD6)
+
+| Exp | Schedule | $p_{max}$ | Missing token | Full | RGBD-only | IMU-only | Avg | Notes |
+|-----|----------|-----------|---------------|------|-----------|----------|-----|-------|
+| MD1 | fixed | 0.1 | zero | 0.8860 | 0.2163 | 0.8256 | 0.6426 | Baseline dropout |
+| **MD2** | **curriculum** | **0.3** | **missing_token** | **0.8884** | **0.3698** | **0.8488** | **0.7023** | Curriculum helps |
+| MD3 | curriculum | 0.3 | zero | 0.8744 | 0.2698 | 0.8209 | 0.6550 | zero-fill worse |
+| **MD4** | **curriculum** | **0.3** | **zero** | **0.8930** | **0.3558** | **0.8767** | **0.7085** | Best dataset-level |
+| MD5 | fixed | 0.15 | missing_token | 0.8860 | 0.2907 | 0.8302 | 0.6690 | Low p, weak |
+| MD6 | simultaneous | 0.3 | zero | 0.8791 | 0.3023 | 0.8395 | 0.6736 | 3-pass costly, no gain |
+
+**Dataset-level MD best: MD4** (Full=0.8930, RGBD=0.3558, IMU=0.8767, Avg=0.7085)
+
+### 3.2 Staged Training (ST1) — FAILED
+
+Hypothesis: a 3-phase curriculum (IMU warmup → RGBD focus with partial freeze → joint fine-tune) could force independent branch learning without destroying fusion.
+
+| Phase | Epochs | Params Active | Peak Val Acc | Description |
+|-------|--------|---------------|--------------|-------------|
+| 1 | 1–20 | ~417K (IMU + head only) | 73.26% | IMU-only warmup |
+| 2 | 21–40 | ~8.9M (RGBD encoder unfrozen) | 79.53% | RGBD focus |
+| 3 | 41–100 | ~9.2M (all) | 82.79% | Joint fine-tune |
+
+**ST1 missing-modality results (checkpoints/staged_rgbd_imu_ST1.pt):**
+- Full: 0.8279, RGBD-only: **0.0279** (catastrophic), IMU-only: 0.7488
+- **Conclusion: FAILED.** The model never saw zeroed-modality inputs during training, so inference with one branch zeroed is completely out-of-distribution. RGBD-only performance was *worse* than the naïve R4 baseline (2.79% vs 14.19%).
+
+### 3.3 Feature-level Dropout — MDdrop1
+
+Simpler, direct approach: zero features inside `forward()` at feature level.
+
+Config: `md_drop_imu=0.20`, `md_drop_rgbd=0.10`, all else same as R4.
+
+| Condition | Accuracy | F1 |
+|---|---|---|
+| Full (both) | 0.8860 | 0.8805 |
+| RGBD-only | 0.3465 | 0.3181 |
+| IMU-only | 0.8488 | 0.8430 |
+| Average | 0.6938 | 0.6805 |
+
+MDdrop1 significantly improves RGBD-only vs R4 (+20pp), and IMU-only also improves. However, Full accuracy regressed vs R4 (88.60% < 89.77%), suggesting the higher dropout disrupts fusion quality.
+
+**Key insight from MDdrop1:** With only 20% IMU dropout, the model still leans heavily on IMU as the "easy" path. RGBD branch gets insufficient gradient signal for independent learning.
+
+### 3.4 Feature-level Dropout + CMAR — CMAR1 ⭐ BEST
+
+Combine stronger IMU dropout with CMAR alignment regularization:
+
+Config: `md_drop_imu=0.35`, `md_drop_rgbd=0.10`, `cmar_weight=0.1`, `cmar_proj_dim=64`.
+
+Training trajectory highlights:
+- Epoch 5 (warmup end): 37.21% — lower than MDdrop1 (50.23%), expected due to harder dropout regime
+- Epoch 40: 87.67% — model catching up as CMAR guides RGBD branch  
+- Epoch 62: 90.70% — new milestone, breaking 90% for first time
+- Epoch 72: **90.93%** — best (checkpoint saved)
+- Epoch 100: 89.53% (cosine decay, best from ep72)
+
+**CMAR1 missing-modality evaluation:**
+
+| Condition | Accuracy | F1 |
+|---|---|---|
+| Full (both) | **0.9093** | **0.9061** |
+| RGBD-only | **0.4163** | **0.4072** |
+| IMU-only | **0.8628** | **0.8599** |
+| Average | **0.7295** | **0.7244** |
+| Degradation | **0.4930** | — |
+
+---
+
+## 4. Comprehensive Comparison
+
+| Exp | Method | Full | RGBD-only | IMU-only | Avg | Degradation |
+|-----|--------|------|-----------|----------|-----|-------------|
+| R4 | No robustness training | 0.8977 | 0.1419 | 0.7302 | 0.5900 | 0.7558 |
+| MD4 | Dataset-level curriculum MD | 0.8930 | 0.3558 | 0.8767 | 0.7085 | 0.5372 |
+| MD2 | Dataset-level curriculum + missing_token | 0.8884 | 0.3698 | 0.8488 | 0.7023 | 0.5186 |
+| MDdrop1 | Feature-level drop (imu=0.20) | 0.8860 | 0.3465 | 0.8488 | 0.6938 | 0.5395 |
+| ST1 | Staged training | 0.8279 | 0.0279 | 0.7488 | 0.5349 | 0.8000 |
+| **CMAR1** | **Feature-level drop (imu=0.35) + CMAR** | **0.9093** | **0.4163** | **0.8628** | **0.7295** | **0.4930** |
+
+---
+
+## 5. Analysis: Why CMAR1 Works
+
+### 5.1 The RGBD Branch Collapse Problem
+
+Without any robustness mechanism, the model faces an easy optimization shortcut: IMU alone can reach ~73% accuracy, while RGBD requires expensive learning (431 training samples, 50K+ pixel values per frame). The fusion mechanism learns to rely almost entirely on IMU features, causing the RGBD branch to produce near-constant representations — useful only as a small correction bias.
+
+This manifests as:
+- Full accuracy: near-optimal (model uses IMU well)
+- RGBD-only: ~14% (branch produces near-constant output → random guessing)
+- The zero-IMU input is completely OOD for a network never trained with it
+
+### 5.2 How MD-Drop Fixes OOD
+
+By randomly zeroing IMU features in 35% of training batches, the model is forced to classify from RGBD alone in ~1 in 3 steps. The gradient signal from these forced RGBD-only steps incentivizes the RGBD encoder to produce discriminative features for the classifier.
+
+Without CMAR, however, the RGBD branch still produces representations in a different subspace from IMU — fusion still uses modality-specific "shortcuts" rather than building a unified representation.
+
+### 5.3 How CMAR Complements MD-Drop
+
+CMAR enforces that even in the 55% of batches where **both modalities are present**, the RGBD branch must build representations that are **aligned with IMU representations**. This has two effects:
+
+1. **Anti-collapse**: RGBD features cannot degenerate to near-zero or constant representations (which would maximize CMAR loss)
+2. **Transfer signal**: The well-learned IMU representation acts as a "teacher" — RGBD is continuously pulled toward a semantically meaningful representation, accelerating learning from the sparse RGBD-only batches
+
+Crucially, the projection heads ($\text{Proj}_{rgbd}$, $\text{Proj}_{imu}$) isolate CMAR's effect: the main feature space remains free to diverge as needed for cross-modal fusion, while alignment is enforced only in the 64-dim projection space. This prevents collapse into trivially aligned (but uninformative) representations.
+
+### 5.4 Why Stronger IMU Dropout (0.35 > 0.20) Helped Full Accuracy
+
+Counterintuitively, CMAR1 achieves **higher Full accuracy (90.93%)** than MDdrop1 (88.60%) despite using stronger IMU dropout. The explanation:
+
+- MDdrop1 at 20% still allows IMU to dominate fusion in the majority of batches
+- CMAR1's stronger IMU dropout (35%) forces more balanced branch training
+- CMAR's alignment loss ensures this doesn't hurt IMU-path performance
+- A model with two well-trained branches fuses better than one with a dominant-branch bias
+
+The net result: CMAR1's RGBD branch is strong enough that combining both modalities creates **genuine complementarity** rather than one branch correcting the other's noise.
+
+---
+
+## 6. Leaderboard (RGBD+IMU All Experiments)
+
+| Rank | Exp | Full | RGBD-only | IMU-only | Avg | F1 |
+|------|-----|------|-----------|----------|-----|----|
+| 🥇 | **CMAR1** | **0.9093** | **0.4163** | **0.8628** | **0.7295** | 0.9061 |
+| 🥈 | R4 (no robust) | 0.8977 | 0.1419 | 0.7302 | 0.5900 | 0.8951 |
+| 🥉 | MD4 | 0.8930 | 0.3558 | 0.8767 | 0.7085 | — |
+| 4 | MD2 | 0.8884 | 0.3698 | 0.8488 | 0.7023 | — |
+| 5 | MDdrop1 | 0.8860 | 0.3465 | 0.8488 | 0.6938 | 0.8805 |
+| 6 | MD6 | 0.8791 | 0.3023 | 0.8395 | 0.6736 | — |
+| 7 | MD1 | 0.8860 | 0.2163 | 0.8256 | 0.6426 | — |
+| 8 | ST1 | 0.8279 | 0.0279 | 0.7488 | 0.5349 | 0.8165 |
+
+---
+
+## 7. Training Command (CMAR1 — Best)
+
+```powershell
+conda activate mma
+cd "E:\VS Code Project\COMP 4901D"
+python train/run_train.py --pipeline rgbd_imu --data_root "./datasets/UTD-MHAD" `
+  --epochs 100 --save_name rgbd_imu_CMAR1.pt --tb_dir runs --num_workers 0 `
+  --batch_size 32 --label_smoothing 0.1 --mixup_alpha 0.15 --weight_decay 0.008 `
+  --scheduler cosine_warmup --warmup_epochs 5 --lr 3e-4 --patience 40 --seed 42 `
+  --dataset_kwargs '{"augment":true}' `
+  --model_kwargs '{"d_model":160,"fusion":"cross_mamba","aux_weight":0.1,"encoder":"pretrained","freeze":"partial","temporal_velocity":true,"md_schedule":"none","md_drop_imu":0.35,"md_drop_rgbd":0.10,"cmar_weight":0.1,"cmar_proj_dim":64}'
+```
+
+## 8. Evaluation Command
+
+```powershell
+python infer/run_infer.py --pipeline rgbd_imu --data_root "datasets/UTD-MHAD" `
+  --checkpoint "checkpoints/rgbd_imu_CMAR1.pt" --num_workers 0 --eval_missing all
+```
+
+Expected output:
+```
+Condition              Accuracy         F1
+Full (both)              0.9093     0.9061
+RGBD-only                0.4163     0.4072
+IMU-only                 0.8628     0.8599
+Average                  0.7295     0.7244
+Degradation              0.4930
+```

@@ -45,6 +45,9 @@ class UTDMADRGBDIMUDataset(Dataset):
         modality_dropout: dict = None,
         augment: bool = False,
         use_flow: bool = False,
+        use_frame_diff: bool = False,
+        diff_channels: str = "all",
+        smooth_depth_diff: bool = False,
     ):
         super().__init__()
         self.n_frames = n_frames
@@ -55,6 +58,9 @@ class UTDMADRGBDIMUDataset(Dataset):
         self.gaf_size = gaf_size
         self.augment = augment
         self.use_flow = use_flow
+        self.use_frame_diff = use_frame_diff
+        self.diff_channels = diff_channels
+        self.smooth_depth_diff = smooth_depth_diff
 
         # Modality-loss simulation (training only)
         if modality_dropout is not None:
@@ -261,8 +267,47 @@ class UTDMADRGBDIMUDataset(Dataset):
     def __len__(self):
         return len(self.labels)
 
+    def _compute_frame_diff(self, rgbd):
+        """Compute temporal frame differences and concatenate as extra channels.
+
+        rgbd: (T, C, H, W) -> (T, C+diff_ch, H, W)
+        diff_channels: "all" -> full 4-ch diff, "rgb_only" -> 3-ch, "depth_only" -> 1-ch
+        """
+        T, C, H, W = rgbd.shape
+
+        if self.diff_channels == "rgb_only":
+            src = rgbd[:, :3]           # (T, 3, H, W)
+        elif self.diff_channels == "depth_only":
+            src = rgbd[:, 3:4]          # (T, 1, H, W)
+            if self.smooth_depth_diff:
+                from scipy.ndimage import gaussian_filter
+                for t in range(T):
+                    src[t, 0] = gaussian_filter(src[t, 0], sigma=0.5)
+        else:  # "all"
+            src = rgbd[:, :4].copy()    # (T, 4, H, W)
+            if self.smooth_depth_diff:
+                from scipy.ndimage import gaussian_filter
+                for t in range(T):
+                    src[t, 3] = gaussian_filter(src[t, 3], sigma=0.5)
+
+        # Forward diff: diff[t] = src[t+1] - src[t] for t<T-1, diff[T-1] = diff[T-2]
+        diff = np.empty_like(src)
+        diff[:-1] = src[1:] - src[:-1]
+        # First frame uses forward difference too; last frame repeats previous diff
+        # Actually: diff[0] = src[1]-src[0] (already computed), use backward pad for last
+        # Per spec: diff[0] = frame[1]-frame[0] (forward diff for first frame)
+        # Recompute: diff[t] = frame[t] - frame[t-1] for t>=1, diff[0] = frame[1]-frame[0]
+        diff[1:] = src[1:] - src[:-1]
+        diff[0] = src[1] - src[0] if T > 1 else np.zeros_like(src[0])
+
+        return np.concatenate([rgbd, diff], axis=1)  # (T, C+diff_ch, H, W)
+
     def __getitem__(self, idx):
         rgbd = self.rgbd_data[idx].copy()  # (T, 4, H, W) float32 ndarray
+
+        # Frame differencing BEFORE augmentation (so augmentation is consistent)
+        if self.use_frame_diff:
+            rgbd = self._compute_frame_diff(rgbd)
 
         # Training augmentation (applied consistently across all frames)
         if self.augment:

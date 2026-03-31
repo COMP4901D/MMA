@@ -36,13 +36,16 @@ class PretrainedCNN(nn.Module):
             in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False,
         )
         with torch.no_grad():
-            # Copy pretrained weights for first 3 channels
+            # Copy pretrained weights for first 3 channels (RGB)
             new_conv.weight[:, :3] = old_conv.weight
-            # Initialize extra channels with mean of RGB weights
+            # Channel 3 (Depth): mean of RGB weights
             if in_channels > 3:
                 mean_w = old_conv.weight.mean(dim=1, keepdim=True)
-                for c in range(3, in_channels):
-                    new_conv.weight[:, c : c + 1] = mean_w
+                new_conv.weight[:, 3:4] = mean_w
+            # Channels 4+ (frame diff): small random init so model
+            # starts from pretrained state and gradually learns diff
+            if in_channels > 4:
+                nn.init.normal_(new_conv.weight[:, 4:], std=0.01)
 
         self.conv1 = new_conv
         self.bn1 = base.bn1

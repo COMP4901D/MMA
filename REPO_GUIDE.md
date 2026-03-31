@@ -1,5 +1,5 @@
 # COMP 4901D MMA — Repository Guide
-Last Updated: 2025-07-20
+Last Updated: 2026-03-31
 
 ## Project Overview
 
@@ -8,7 +8,7 @@ Last Updated: 2025-07-20
 **核心方法:**
 - **Momentum Mamba (MMA):** 在 Mamba 选择性状态空间模型 (SSM) 中引入动量机制 (real / complex)，增强时序建模能力
 - **MMA-MMTSA:** 结合 Gramian Angular Field (GAF) 成像、时间段稀疏采样 (Temporal Segment Sampling) 与动量注意力融合
-- **Multimodal MMA (RGB-D + IMU):** 基于跨模态 Mamba 架构，融合 RGB-D 视频和 IMU 传感器数据，支持 PretrainedCNN (ResNet18) 和 SpatialCNN 编码器
+- **Multimodal MMA (RGB-D + IMU):** 基于跨模态 Mamba 架构，融合 RGB-D 视频和 IMU 传感器数据，支持 PretrainedCNN (ResNet18) 和 SpatialCNN 编码器；引入 Feature-level Modality Dropout (MD-Drop) 和 Cross-Modal Alignment Regularization (CMAR) 以提升单模态缺失鲁棒性 (**最佳: Full=0.9093, RGBD-only=0.4163, IMU-only=0.8628**)
 - **Multimodal MMA (Skeleton + IMU):** 基于跨模态 Mamba 架构，融合骨骼关节序列和 IMU 传感器数据 (**最佳方法: Acc=0.9628**)
 
 **关键特性:**
@@ -293,7 +293,7 @@ tensorboard --logdir runs
 |------|--------|------|------|
 | `MomentumMambaHAR` | ~321K | `(B, L, 6)` | `(B, 27)` logits |
 | `MMA_MMTSA` | ~4.3M | `(depth, imu)` | `(logits, aux_dict)` |
-| `MultimodalMMA` | ~1.4M | `(rgbd, imu)` | `(B, 27)` logits |
+| `MultimodalMMA` | ~9.6M | `(rgbd, imu)` | `(B, 27)` logits |
 | `MMA_SkeletonIMU` | ~450K | `(skel, imu)` | `(B, 27)` logits |
 | `MuMu` | ~448K | `[x_list]` | `(y_aux, y_target, alpha, attn)` |
 
@@ -336,6 +336,33 @@ MuMu 协作式多任务多模态融合：
 ### Gramian Angular Field (GAF)
 
 1D 时间序列 → 2D 图像: 归一化 → $\phi = \arccos(\text{scaled})$ → $G[i,j] = \cos(\phi_i + \phi_j)$ → 灰度
+
+### Feature-level Modality Dropout (MD-Drop)
+
+在 `MultimodalMMA.forward()` 编码之后、融合之前，以概率随机将某一模态特征全部置零：
+
+```
+r = random.random()
+if r < md_drop_imu:   fi = zeros_like(fi)   # RGBD-only path
+elif r < md_drop_imu + md_drop_rgbd:  fv = zeros_like(fv)   # IMU-only path
+# else: both modalities present
+```
+
+这迫使模型在训练时见到缺失模态的输入，消除推理时 out-of-distribution 问题。
+
+构造参数: `md_drop_imu` (default 0.0), `md_drop_rgbd` (default 0.0)。
+
+### Cross-Modal Alignment Regularization (CMAR)
+
+在编码之后对两个分支施加表示对齐约束，防止弱势模态（RGBD）彻底"摆烂"：
+
+$$\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{aux} \cdot \mathcal{L}_{aux} + \lambda_{cmar} \cdot \| \text{Proj}_{rgbd}(\bar{h}^{rgbd}) - \text{Proj}_{imu}(\bar{h}^{imu}) \|^2$$
+
+其中 $\bar{h}$ 为时间维度上的 mean-pool，两个 `Linear(d_model → cmar_proj_dim)` 投影到共享对齐空间。
+即使 IMU 分支已能准确分类，CMAR 也会强制 RGBD 特征向 IMU 特征对齐，避免 RGBD 编码器退化为常量输出。
+
+构造参数: `cmar_weight` (default 0.0), `cmar_proj_dim` (default 64)。
+CMAR loss 由 `MultimodalMMA` 存储于 `_cmar_loss`，由 `train/default_train.py` 读取并加入总损失。
 
 ---
 
@@ -386,6 +413,20 @@ RGB+Depth → RGBD (N,4,112,112) ─┐
 IMU (T,6) → 归一化 ─────────────┘ → MultimodalMMA → logits (B,27)
 ```
 
+**关键 model_kwargs 说明 (仅 rgbd_imu):**
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `encoder` | str | `"spatial_cnn"` | `"pretrained"` = ResNet18, `"convnextv2"` = ConvNeXtV2 |
+| `freeze` | str | `"all"` | `"partial"` = layer4+proj 可训练, `"none"` = 全量微调 |
+| `temporal_velocity` | bool | `false` | 特征速度: $v_t = f_t - f_{t-1}$, 与 $f_t$ 拼接后投影 |
+| `md_drop_imu` | float | `0.0` | Feature-level dropout: 以该概率将 IMU 特征归零 (训练期间) |
+| `md_drop_rgbd` | float | `0.0` | Feature-level dropout: 以该概率将 RGBD 特征归零 (训练期间) |
+| `cmar_weight` | float | `0.0` | CMAR 损失权重 $\lambda_{cmar}$；0 = 禁用 |
+| `cmar_proj_dim` | int | `64` | CMAR 对齐投影维度 |
+| `aux_weight` | float | `0.0` | 辅助分类头损失权重 |
+| `md_schedule` | str | `"none"` | 数据集级 Modality Dropout: `"fixed"`, `"curriculum"`, `"simultaneous"` |
+
 ---
 
 ## Dataset: UTD-MHAD
@@ -412,8 +453,10 @@ IMU (T,6) → 归一化 ─────────────┘ → Multimoda
 
 | 文件 | 管线 | 融合 | Acc | 说明 |
 |------|------|------|-----|------|
-| `checkpoints/skel_imu_exp25.pt` | skel_imu | cross_mamba | **0.9628** | ★ 最佳模型 |
-| `checkpoints/rgbd_imu_R4.pt` | rgbd_imu | cross_mamba | 0.8977 | RGBD+IMU 最佳 |
+| `checkpoints/skel_imu_exp25.pt` | skel_imu | cross_mamba | **0.9628** | ★ 骨骼+IMU 最佳 |
+| `checkpoints/rgbd_imu_CMAR1.pt` | rgbd_imu | cross_mamba | **0.9093** | ★ RGBD+IMU 最佳 (CMAR + MD-Drop) |
+| `checkpoints/rgbd_imu_MDdrop1.pt` | rgbd_imu | cross_mamba | 0.8860 | MD-Drop 消融 |
+| `checkpoints/rgbd_imu_R4.pt` | rgbd_imu | cross_mamba | 0.8977 | 无缺失鲁棒化基线 |
 | `checkpoints/mma_mmtsa_best.pt` | mmtsa | attention | — | MMTSA 基线 |
 | `checkpoints/mma_rgbd_imu_attention_real_best.pt` | rgbd_imu | attention | — | 早期实验 |
 | `checkpoints/mma_rgbd_imu_concat_real_best.pt` | rgbd_imu | concat | — | 早期实验 |
@@ -423,12 +466,16 @@ IMU (T,6) → 归一化 ─────────────┘ → Multimoda
 
 ## Best Results
 
-| Pipeline | Model | Best Acc | Best F1 | Key Config | Checkpoint |
-|----------|-------|----------|---------|------------|------------|
-| **Skeleton + IMU** | MMA_SkeletonIMU | **0.9628** | **0.9622** | cross_mamba, aux=0.1, d=160, bs=16, lr=3e-4 | `skel_imu_exp25.pt` |
-| RGBD + IMU | MultimodalMMA | 0.8977 | 0.8951 | ResNet18 partial, vel+aug, cross_mamba, aux=0.1, bs=8 | `rgbd_imu_R4.pt` |
+| Pipeline | Model | Best Acc | Best F1 | RGBD-only | IMU-only | Key Config | Checkpoint |
+|----------|-------|----------|---------|-----------|----------|------------|------------|
+| **Skeleton + IMU** | MMA_SkeletonIMU | **0.9628** | **0.9622** | N/A | N/A | cross_mamba, aux=0.1, d=160, bs=16, lr=3e-4 | `skel_imu_exp25.pt` |
+| **RGBD + IMU (robust)** | MultimodalMMA | **0.9093** | **0.9061** | **0.4163** | **0.8628** | CMAR+MDdrop, md_drop_imu=0.35, cmar_weight=0.1 | `rgbd_imu_CMAR1.pt` |
+| RGBD + IMU (baseline) | MultimodalMMA | 0.8977 | 0.8951 | 0.1419 | 0.7302 | ResNet18 partial, vel+aug, cross_mamba, aux=0.1 | `rgbd_imu_R4.pt` |
 
-**推荐方法:** Skeleton+IMU (Exp25) — 通过 cross-mamba 融合 + 辅助损失实现 96.28% 准确率。若无法获取骨骼数据，RGBD+IMU (R4) 可达 89.77%。
+**推荐方法:**
+- **有骨骼数据时:** Skeleton+IMU (Exp25) — 96.28% 准确率，轻量级 (~450K 参数)
+- **无骨骼数据时:** RGBD+IMU CMAR1 — 90.93% 准确率，且在单模态缺失下保持鲁棒 (RGBD 41.63%, IMU 86.28%)
+- **若不需要缺失鲁棒性:** RGBD+IMU R4 — 89.77%，更快训练 (bs=8)
 
 详细实验报告见 `experiment_report.md`。
 

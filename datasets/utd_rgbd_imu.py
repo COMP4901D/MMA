@@ -20,7 +20,7 @@ import torch
 from scipy.interpolate import interp1d
 from torch.utils.data import Dataset
 
-from .transforms import GAFEncoder, ModalityDropout
+from .transforms import GAFEncoder, ModalityDropout, SensorCorruptionAugment
 
 
 class UTDMADRGBDIMUDataset(Dataset):
@@ -43,11 +43,7 @@ class UTDMADRGBDIMUDataset(Dataset):
         imu_as_gaf: bool = False,
         gaf_size: int = 64,
         modality_dropout: dict = None,
-        augment: bool = False,
-        use_flow: bool = False,
-        use_frame_diff: bool = False,
-        diff_channels: str = "all",
-        smooth_depth_diff: bool = False,
+        sensor_corruption: dict = None,
     ):
         super().__init__()
         self.n_frames = n_frames
@@ -56,17 +52,18 @@ class UTDMADRGBDIMUDataset(Dataset):
         self.depth_clip = depth_clip
         self.imu_as_gaf = imu_as_gaf
         self.gaf_size = gaf_size
-        self.augment = augment
-        self.use_flow = use_flow
-        self.use_frame_diff = use_frame_diff
-        self.diff_channels = diff_channels
-        self.smooth_depth_diff = smooth_depth_diff
 
         # Modality-loss simulation (training only)
         if modality_dropout is not None:
             self.modality_dropout = ModalityDropout(**modality_dropout)
         else:
             self.modality_dropout = None
+
+        # Sensor corruption augmentation (training only)
+        if sensor_corruption is not None:
+            self.sensor_corruption = SensorCorruptionAugment(**sensor_corruption)
+        else:
+            self.sensor_corruption = None
         self._rng = np.random.default_rng()
 
         # Locate folders
@@ -211,11 +208,8 @@ class UTDMADRGBDIMUDataset(Dataset):
         rgb_idx = self._uniform_sample(n_rgb, self.n_frames)
         dep_idx = self._uniform_sample(n_dep, self.n_frames)
 
-        # Build RGBD-Flow: 4ch(RGBD) + 2ch(optical flow) = 6 channels
-        n_ch = 6 if self.use_flow else 4
-        out = np.empty((self.n_frames, n_ch, S, S), dtype=np.float32)
+        out = np.empty((self.n_frames, 4, S, S), dtype=np.float32)
 
-        prev_gray = None
         for i in range(self.n_frames):
             rgb = (
                 cv2.resize(rgb_frames[rgb_idx[i]], (S, S)).astype(np.float32)
@@ -226,24 +220,6 @@ class UTDMADRGBDIMUDataset(Dataset):
             dep = cv2.resize(depth_frames[dep_idx[i]], (S, S))
             dep = np.clip(dep, 0, self.depth_clip) / self.depth_clip
             out[i, 3] = dep
-
-            if self.use_flow:
-                gray = cv2.cvtColor(
-                    (rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY
-                )
-                if prev_gray is not None:
-                    flow = cv2.calcOpticalFlowFarneback(
-                        prev_gray, gray, None,
-                        pyr_scale=0.5, levels=3, winsize=15,
-                        iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
-                    )
-                    # Normalize flow to [-1, 1] (clamp at ±20 pixels)
-                    flow = np.clip(flow / 20.0, -1.0, 1.0)
-                    out[i, 4] = flow[:, :, 0]  # horizontal
-                    out[i, 5] = flow[:, :, 1]  # vertical
-                else:
-                    out[i, 4:6] = 0.0
-                prev_gray = gray
 
         return out
 
@@ -267,51 +243,8 @@ class UTDMADRGBDIMUDataset(Dataset):
     def __len__(self):
         return len(self.labels)
 
-    def _compute_frame_diff(self, rgbd):
-        """Compute temporal frame differences and concatenate as extra channels.
-
-        rgbd: (T, C, H, W) -> (T, C+diff_ch, H, W)
-        diff_channels: "all" -> full 4-ch diff, "rgb_only" -> 3-ch, "depth_only" -> 1-ch
-        """
-        T, C, H, W = rgbd.shape
-
-        if self.diff_channels == "rgb_only":
-            src = rgbd[:, :3]           # (T, 3, H, W)
-        elif self.diff_channels == "depth_only":
-            src = rgbd[:, 3:4]          # (T, 1, H, W)
-            if self.smooth_depth_diff:
-                from scipy.ndimage import gaussian_filter
-                for t in range(T):
-                    src[t, 0] = gaussian_filter(src[t, 0], sigma=0.5)
-        else:  # "all"
-            src = rgbd[:, :4].copy()    # (T, 4, H, W)
-            if self.smooth_depth_diff:
-                from scipy.ndimage import gaussian_filter
-                for t in range(T):
-                    src[t, 3] = gaussian_filter(src[t, 3], sigma=0.5)
-
-        # Forward diff: diff[t] = src[t+1] - src[t] for t<T-1, diff[T-1] = diff[T-2]
-        diff = np.empty_like(src)
-        diff[:-1] = src[1:] - src[:-1]
-        # First frame uses forward difference too; last frame repeats previous diff
-        # Actually: diff[0] = src[1]-src[0] (already computed), use backward pad for last
-        # Per spec: diff[0] = frame[1]-frame[0] (forward diff for first frame)
-        # Recompute: diff[t] = frame[t] - frame[t-1] for t>=1, diff[0] = frame[1]-frame[0]
-        diff[1:] = src[1:] - src[:-1]
-        diff[0] = src[1] - src[0] if T > 1 else np.zeros_like(src[0])
-
-        return np.concatenate([rgbd, diff], axis=1)  # (T, C+diff_ch, H, W)
-
     def __getitem__(self, idx):
-        rgbd = self.rgbd_data[idx].copy()  # (T, 4, H, W) float32 ndarray
-
-        # Frame differencing BEFORE augmentation (so augmentation is consistent)
-        if self.use_frame_diff:
-            rgbd = self._compute_frame_diff(rgbd)
-
-        # Training augmentation (applied consistently across all frames)
-        if self.augment:
-            rgbd = self._augment_rgbd(rgbd)
+        rgbd = self.rgbd_data[idx]  # (T, 4, H, W) float32 ndarray
 
         imu = (self.imu_data[idx] - self.iner_mean) / self.iner_std
         if self.imu_as_gaf:
@@ -319,9 +252,9 @@ class UTDMADRGBDIMUDataset(Dataset):
         else:
             imu = self._resample_1d(imu, self.max_imu_len)
 
-        # IMU augmentation (jitter + scaling, same as skeleton pipeline)
-        if self.augment:
-            imu = self._augment_imu(imu)
+        # Apply sensor corruption augmentation
+        if self.sensor_corruption is not None:
+            rgbd, imu = self.sensor_corruption(rgbd, imu, rng=self._rng)
 
         # Apply modality dropout *before* converting to tensor
         if self.modality_dropout is not None:
@@ -332,52 +265,3 @@ class UTDMADRGBDIMUDataset(Dataset):
 
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return rgbd, imu, label
-
-    # --- Augmentation helpers ---
-
-    def _augment_rgbd(self, rgbd):
-        """Apply spatial augmentations consistently across all frames.
-
-        - Random horizontal flip (p=0.5)
-        - Random crop (scale 0.8-1.0) then resize back
-        - Color jitter on RGB channels only (brightness, contrast)
-        """
-        T, C, H, W = rgbd.shape
-
-        # Random horizontal flip
-        if self._rng.random() < 0.5:
-            rgbd = rgbd[:, :, :, ::-1].copy()
-            # Flip horizontal flow channel sign if present
-            if C >= 6:
-                rgbd[:, 4] = -rgbd[:, 4]
-
-        # Random crop: crop a subregion and resize back
-        scale = self._rng.uniform(0.8, 1.0)
-        crop_h, crop_w = int(H * scale), int(W * scale)
-        top = self._rng.integers(0, H - crop_h + 1)
-        left = self._rng.integers(0, W - crop_w + 1)
-        for i in range(T):
-            cropped = rgbd[i, :, top : top + crop_h, left : left + crop_w]
-            # Resize back: transpose to (H, W, C) for cv2, then back
-            cropped_hwc = cropped.transpose(1, 2, 0)
-            resized = cv2.resize(cropped_hwc, (W, H))
-            rgbd[i] = resized.transpose(2, 0, 1)
-
-        # Color jitter on RGB channels only (brightness + contrast)
-        brightness = self._rng.uniform(0.85, 1.15)
-        contrast = self._rng.uniform(0.85, 1.15)
-        rgbd[:, :3] = np.clip(
-            (rgbd[:, :3] - 0.5) * contrast + 0.5 + (brightness - 1.0),
-            0.0, 1.0,
-        )
-
-        return rgbd
-
-    def _augment_imu(self, imu):
-        """Apply jitter + scaling to IMU (mirrors skeleton pipeline)."""
-        # Jitter
-        imu = imu + self._rng.normal(0, 0.03, size=imu.shape).astype(np.float32)
-        # Scaling
-        scale = self._rng.normal(1.0, 0.1, size=(1, imu.shape[1])).astype(np.float32)
-        imu = imu * scale
-        return imu

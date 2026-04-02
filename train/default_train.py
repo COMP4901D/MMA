@@ -22,11 +22,25 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 #  Forward helpers
 # ================================================================
 
+def _apply_cleaning_dae(inputs, cfg):
+    """Apply frozen Cleaning DAE to inputs if configured."""
+    dae = cfg.get("cleaning_dae")
+    if dae is None:
+        return inputs
+    # inputs = [rgbd, imu] for rgbd_imu pipeline
+    if len(inputs) >= 2:
+        with torch.no_grad():
+            rgbd, imu = dae(inputs[0], inputs[1])
+        return [rgbd, imu] + list(inputs[2:])
+    return inputs
+
+
 def model_forward(model, batch, device, cfg):
     """Run forward pass. Returns (output, labels)."""
     batch = [b.to(device) for b in batch]
     labels = batch[-1]
     inputs = batch[:-1]
+    inputs = _apply_cleaning_dae(inputs, cfg)
     if cfg.get("input_mode") == "list":
         output = model(inputs)
     else:
@@ -65,14 +79,26 @@ def mixup_forward(model, batch, device, cfg, criterion, alpha):
     B = labels.size(0)
     perm = torch.randperm(B, device=device)
 
+    # DAE must process individual samples BEFORE mixup blending,
+    # because the DAE was trained on single samples, not convex combinations.
+    inputs = _apply_cleaning_dae(inputs, cfg)
     mixed = [lam * x + (1 - lam) * x[perm] for x in inputs]
     if cfg.get("input_mode") == "list":
         output = model(mixed)
     else:
         output = model(*mixed)
 
-    logits = extract_logits(output, cfg)
-    loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels[perm])
+    # Handle simultaneous mode dict output
+    if isinstance(output, dict):
+        logits = output["logits"]
+        md_lam = output["md_lambda"]
+        loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels[perm])
+        loss_rgbd = lam * criterion(output["logits_rgbd_only"], labels) + (1 - lam) * criterion(output["logits_rgbd_only"], labels[perm])
+        loss_imu = lam * criterion(output["logits_imu_only"], labels) + (1 - lam) * criterion(output["logits_imu_only"], labels[perm])
+        loss = loss + md_lam * (loss_rgbd + loss_imu)
+    else:
+        logits = extract_logits(output, cfg)
+        loss = lam * criterion(logits, labels) + (1 - lam) * criterion(logits, labels[perm])
 
     # Auxiliary multi-task loss in mixup path
     base_model = model.module if hasattr(model, 'module') else model

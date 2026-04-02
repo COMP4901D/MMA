@@ -183,14 +183,18 @@ def _build_modality_dropout_kwargs(args) -> dict | None:
     """
     if args.corruption_mode == "none":
         return None
-    return {
+    kw = {
         "mode": args.corruption_mode,
         "p_full": args.corruption_p_full,
         "p_consecutive": args.corruption_p_consecutive,
         "consecutive_len_range": tuple(args.corruption_block_range),
         "modalities": args.corruption_modalities,
         "both_drop_prob": args.corruption_both_drop_prob,
+        "noise_std": args.corruption_noise_std,
     }
+    if args.corruption_noise_snr_db is not None:
+        kw["noise_snr_db"] = args.corruption_noise_snr_db
+    return kw
 
 
 def create_test_dataset(DatasetClass, data_key, data_root,
@@ -271,7 +275,8 @@ def parse_args():
 
     # Corruption / modality dropout (for robustness evaluation)
     p.add_argument("--corruption_mode", type=str, default="none",
-                   choices=["none", "full", "consecutive", "mixed"],
+                   choices=["none", "full", "consecutive", "mixed",
+                            "noise", "noise_full", "noise_consec"],
                    help="Modality dropout mode (none = disabled)")
     p.add_argument("--corruption_p_full", type=float, default=0.2,
                    help="Per-modality probability of full dropout")
@@ -285,6 +290,31 @@ def parse_args():
                    help="Modalities eligible for dropout")
     p.add_argument("--corruption_both_drop_prob", type=float, default=0.0,
                    help="Probability that both modalities are dropped")
+    p.add_argument("--corruption_noise_std", type=float, default=0.5,
+                   help="Gaussian noise std for noise-based corruption modes")
+    p.add_argument("--corruption_noise_snr_db", type=float, default=None,
+                   help="SNR in dB for noise-based modes (overrides noise_std)")
+
+    # Comprehensive robustness evaluation
+    p.add_argument("--eval_robustness", action="store_true",
+                   help="Run comprehensive robustness evaluation across all "
+                        "corruption modes (Centaur-style protocol)")
+
+    # Test-time denoising (applied AFTER corruption, BEFORE model inference)
+    p.add_argument("--test_denoise", type=str, default="none",
+                   choices=["none", "moving_avg", "gaussian",
+                            "median", "savgol", "bilateral_imu"],
+                   help="Test-time denoising filter for corrupted data")
+    p.add_argument("--test_denoise_k", type=int, default=3,
+                   help="Kernel size for test-time denoising filter")
+    p.add_argument("--test_denoise_sigma", type=float, default=0.5,
+                   help="Sigma for Gaussian / bilateral test-time denoising")
+
+    # Centaur-style Cleaning DAE (applied AFTER corruption, BEFORE model)
+    p.add_argument("--cleaning_dae_ckpt", type=str, default=None,
+                   help="Path to trained CleaningDAE checkpoint (.pt). "
+                        "When set, corrupted data is passed through the DAE "
+                        "for cleaning before HAR model inference.")
 
     p.add_argument("--output", type=str, default="preds.npz",
                    help="Path to save predictions (.npz)")
@@ -383,6 +413,486 @@ def _eval_missing(model, loader, criterion, device, pipeline_cfg,
         print(f"{'Average':<20} {avg_acc:>10.4f} {avg_f1:>10.4f}")
         print(f"{'Degradation':<20} {degradation:>10.4f}")
     print(f"{'='*60}")
+
+
+# ================================================================
+#  Test-time denoising filters
+# ================================================================
+
+def _build_test_denoise_fn(args):
+    """Build a test-time denoising function from CLI args.
+
+    Returns a function (rgbd, imu) -> (rgbd, imu) that denoises GPU tensors,
+    or None if no denoising is requested.
+    """
+    mode = getattr(args, "test_denoise", "none")
+    if mode == "none":
+        return None
+
+    k = getattr(args, "test_denoise_k", 3)
+    sigma = getattr(args, "test_denoise_sigma", 0.5)
+
+    # Build 2D Gaussian kernel for RGBD spatial denoising (shared by all modes)
+    k2d = k if k % 2 == 1 else k + 1
+    half2d = k2d // 2
+    ax = torch.arange(-half2d, half2d + 1, dtype=torch.float32)
+    yy, xx = torch.meshgrid(ax, ax, indexing="ij")
+    g2d = torch.exp(-0.5 * (xx ** 2 + yy ** 2) / (sigma ** 2))
+    g2d = g2d / g2d.sum()
+
+    def _blur_rgbd(rgbd, _g2d=g2d):
+        """Apply spatial 2D Gaussian blur to each RGBD frame independently."""
+        B, T, C, H, W = rgbd.shape
+        kernel = _g2d.to(rgbd.device, rgbd.dtype).unsqueeze(0).unsqueeze(0)
+        kernel = kernel.expand(C, 1, -1, -1)
+        frames = rgbd.reshape(B * T, C, H, W)
+        frames = torch.nn.functional.conv2d(
+            frames, kernel, padding=half2d, groups=C,
+        )
+        return frames.reshape(B, T, C, H, W)
+
+    if mode == "moving_avg":
+        k = k if k % 2 == 1 else k + 1
+        pad = k // 2
+
+        def _ma(rgbd, imu):
+            # RGBD: spatial 2D Gaussian blur per frame
+            rgbd_s = _blur_rgbd(rgbd)
+            # IMU: temporal moving average per channel
+            B, T, C = imu.shape
+            kernel = torch.ones(C, 1, k, device=imu.device, dtype=imu.dtype) / k
+            imu_s = torch.nn.functional.conv1d(
+                imu.transpose(1, 2), kernel, padding=pad, groups=C,
+            ).transpose(1, 2)
+            return rgbd_s, imu_s
+
+        return _ma
+
+    elif mode == "gaussian":
+        k = k if k % 2 == 1 else k + 1
+        half = k // 2
+        x = torch.arange(-half, half + 1, dtype=torch.float32)
+        g = torch.exp(-0.5 * (x / sigma) ** 2)
+        g = g / g.sum()
+
+        def _gauss(rgbd, imu):
+            # RGBD: spatial 2D Gaussian blur per frame
+            rgbd_s = _blur_rgbd(rgbd)
+            # IMU: temporal 1D Gaussian per channel
+            B, T, C = imu.shape
+            kernel = g.to(imu.device, imu.dtype).unsqueeze(0).unsqueeze(0).expand(C, 1, -1)
+            imu_s = torch.nn.functional.conv1d(
+                imu.transpose(1, 2), kernel, padding=half, groups=C,
+            ).transpose(1, 2)
+            return rgbd_s, imu_s
+
+        return _gauss
+
+    elif mode == "median":
+        k = k if k % 2 == 1 else k + 1
+        pad = k // 2
+
+        def _median(rgbd, imu):
+            # RGBD: spatial 2D Gaussian blur per frame
+            rgbd_s = _blur_rgbd(rgbd)
+            # IMU: temporal median per channel
+            B, T, C = imu.shape
+            imu_padded = torch.nn.functional.pad(
+                imu.transpose(1, 2), (pad, pad), mode="reflect"
+            )
+            imu_unf = imu_padded.unfold(2, k, 1)
+            imu_s = imu_unf.median(dim=-1).values.transpose(1, 2)
+            return rgbd_s, imu_s
+
+        return _median
+
+    elif mode == "savgol":
+        # Savitzky-Golay filter: polynomial least-squares fitting
+        # Order 2 polynomial, window size k
+        from scipy.signal import savgol_coeffs
+        k = k if k % 2 == 1 else k + 1
+        coeffs = savgol_coeffs(k, min(2, k - 1))  # 2nd order poly
+        half = k // 2
+
+        def _savgol(rgbd, imu):
+            # RGBD: spatial 2D Gaussian blur per frame
+            rgbd_s = _blur_rgbd(rgbd)
+            # IMU: Savitzky-Golay per channel
+            B, T, C = imu.shape
+            kernel_t = torch.tensor(
+                coeffs, device=imu.device, dtype=imu.dtype
+            ).unsqueeze(0).unsqueeze(0).expand(C, 1, -1)
+            imu_s = torch.nn.functional.conv1d(
+                imu.transpose(1, 2), kernel_t, padding=half, groups=C,
+            ).transpose(1, 2)
+            return rgbd_s, imu_s
+
+        return _savgol
+
+    elif mode == "bilateral_imu":
+        # 1D bilateral filter for IMU: range-weighted + spatial Gaussian
+        k = k if k % 2 == 1 else k + 1
+        half = k // 2
+
+        def _bilateral(rgbd, imu):
+            # RGBD: spatial 2D Gaussian blur per frame
+            rgbd_s = _blur_rgbd(rgbd)
+            # IMU: bilateral 1D filter per channel
+            B, T, C = imu.shape
+            imu_padded = torch.nn.functional.pad(
+                imu.transpose(1, 2), (half, half), mode="reflect"
+            )  # (B, C, T+2*half)
+            imu_unf = imu_padded.unfold(2, k, 1)  # (B, C, T, k)
+            center = imu.transpose(1, 2).unsqueeze(-1)  # (B, C, T, 1)
+            # Range weights: penalise neighbours with very different values
+            range_w = torch.exp(-0.5 * ((imu_unf - center) / (sigma + 1e-6)) ** 2)
+            # Spatial weights: Gaussian over position
+            pos = torch.arange(-half, half + 1, device=imu.device, dtype=imu.dtype)
+            spatial_w = torch.exp(-0.5 * (pos / max(sigma, 0.3)) ** 2)
+            w = range_w * spatial_w  # (B, C, T, k)
+            w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)
+            imu_s = (imu_unf * w).sum(dim=-1).transpose(1, 2)  # (B, T, C)
+            return rgbd_s, imu_s
+
+        return _bilateral
+
+    return None
+
+
+# ================================================================
+#  Comprehensive Robustness Evaluation (Centaur-style)
+# ================================================================
+
+def _eval_robustness(model, DatasetClass, data_key, data_root,
+                     default_ds_kwargs, user_ds_kw, norm_keys,
+                     device, batch_size, num_workers, args):
+    """Run Centaur-style comprehensive robustness evaluation.
+
+    Implements the four corruption modes from:
+      Xaviar et al., "Centaur: Robust Multimodal Fusion for HAR",
+      IEEE Sensors Journal, 2024.  (arXiv: 2303.04636)
+
+    Mode 1: Additive white Gaussian noise N(0,sigma) per channel per timestep
+    Mode 2: Per-channel consecutive missing (exponential intervals, independent)
+    Mode 3: Per-sensor consecutive missing (all channels of a modality together)
+    Mode 4: Mode 1 + Mode 2 combined (noise first, then per-channel missing)
+    """
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+    # Paper's noise levels (sigma on normalised data)
+    SIGMA_LEVELS = [0.05, 0.1, 0.2, 0.3]
+    # Consecutive missing: s_corr levels (s_norm is fixed)
+    # RGBD has T=16 frames → s_norm=8, s_corr ∈ {2,4,6}
+    # IMU  has T=128 steps → s_norm=60, s_corr ∈ {15,30,45}
+    RGBD_S_NORM = 8
+    RGBD_S_CORR = [2, 4, 6]
+    IMU_S_NORM  = 60
+    IMU_S_CORR  = [15, 30, 45]
+    N_TRIALS = 3
+
+    results = {}
+
+    # Build test-time denoise function (if any)
+    denoise_fn = _build_test_denoise_fn(args)
+    if denoise_fn is not None:
+        print(f"  Test-time denoising: {args.test_denoise} "
+              f"(k={args.test_denoise_k}, σ={args.test_denoise_sigma})")
+
+    # Build Centaur-style Cleaning DAE (if checkpoint provided)
+    cleaning_dae = None
+    dae_ckpt_path = getattr(args, "cleaning_dae_ckpt", None)
+    if dae_ckpt_path:
+        from model.cleaning_dae import CleaningDAE
+        dae_ckpt = torch.load(dae_ckpt_path, map_location=device, weights_only=False)
+        cleaning_dae = CleaningDAE(
+            enable_imu=dae_ckpt.get("enable_imu", True),
+            enable_rgbd=dae_ckpt.get("enable_rgbd", True),
+            imu_latent_dim=dae_ckpt.get("latent_dim", 64),
+        ).to(device)
+        cleaning_dae.load_state_dict(dae_ckpt["model_state"])
+        cleaning_dae.eval()
+        print(f"  Cleaning DAE loaded: {dae_ckpt_path} "
+              f"(imu={dae_ckpt.get('enable_imu')}, "
+              f"rgbd={dae_ckpt.get('enable_rgbd')})")
+
+    # Build a single clean test dataset and cache data
+    clean_ds = create_test_dataset(
+        DatasetClass, data_key, data_root,
+        default_ds_kwargs, user_ds_kw, norm_keys,
+        modality_dropout_kwargs=None,
+    )
+    clean_loader = DataLoader(
+        clean_ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+
+    @torch.no_grad()
+    def _evaluate_loader(loader):
+        model.eval()
+        all_preds, all_labels = [], []
+        use_amp = (device.type == "cuda")
+        for batch in loader:
+            batch = [b.to(device) for b in batch]
+            labels = batch[-1]
+            rgbd, imu = batch[0], batch[1]
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(rgbd, imu)
+            if isinstance(logits, dict):
+                logits = logits["logits"]
+            elif isinstance(logits, (tuple, list)):
+                logits = logits[1]
+            all_preds.append(logits.float().cpu().argmax(1).numpy())
+            all_labels.append(labels.cpu().numpy())
+        preds = np.concatenate(all_preds)
+        labels = np.concatenate(all_labels)
+        acc = accuracy_score(labels, preds)
+        _, _, f1, _ = precision_recall_fscore_support(
+            labels, preds, average="weighted", zero_division=0)
+        return acc, f1
+
+    @torch.no_grad()
+    def _evaluate_corrupted(corruption_fn, n_trials=N_TRIALS):
+        """Apply corruption to cached tensors and evaluate."""
+        model.eval()
+        use_amp = (device.type == "cuda")
+        accs, f1s = [], []
+        for _ in range(n_trials):
+            all_preds, all_labels = [], []
+            for batch in clean_loader:
+                batch = [b.to(device) for b in batch]
+                labels = batch[-1]
+                rgbd, imu = batch[0].clone(), batch[1].clone()
+                rgbd, imu = corruption_fn(rgbd, imu)
+                # Apply test-time denoising (after corruption, before model)
+                if denoise_fn is not None:
+                    rgbd, imu = denoise_fn(rgbd, imu)
+                # Apply Cleaning DAE (after corruption/denoise, before model)
+                if cleaning_dae is not None:
+                    rgbd, imu = cleaning_dae(rgbd, imu)
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    logits = model(rgbd, imu)
+                if isinstance(logits, dict):
+                    logits = logits["logits"]
+                elif isinstance(logits, (tuple, list)):
+                    logits = logits[1]
+                all_preds.append(logits.float().cpu().argmax(1).numpy())
+                all_labels.append(labels.cpu().numpy())
+            preds = np.concatenate(all_preds)
+            labels = np.concatenate(all_labels)
+            acc = accuracy_score(labels, preds)
+            _, _, f1, _ = precision_recall_fscore_support(
+                labels, preds, average="weighted", zero_division=0)
+            accs.append(acc)
+            f1s.append(f1)
+        return np.mean(accs), np.mean(f1s)
+
+    # --- Corruption primitives (GPU tensors) ---
+
+    def _add_gaussian_noise_sigma(data, sigma):
+        """Mode 1: Add N(0, sigma) noise independently per channel per timestep."""
+        return data + torch.randn_like(data) * sigma
+
+    def _consec_missing_per_channel(data, s_norm, s_corr):
+        """Mode 2: Per-channel independent consecutive missing.
+
+        For each sample and each channel, alternate between normal (Exp(1/s_norm))
+        and corrupted (Exp(1/s_corr)) intervals. Missing values are set to zero.
+        data shape: (..., T, C) for IMU or (B, T, C, H, W) for RGBD.
+        """
+        if data.dim() == 3:
+            # IMU: (B, T, C)
+            B, T, C = data.shape
+            for b in range(B):
+                for c in range(C):
+                    t = 0
+                    normal_phase = True
+                    while t < T:
+                        if normal_phase:
+                            length = int(np.random.exponential(s_norm)) + 1
+                        else:
+                            length = int(np.random.exponential(s_corr)) + 1
+                            end = min(t + length, T)
+                            data[b, t:end, c] = 0.0
+                            t = end
+                            normal_phase = True
+                            continue
+                        t += length
+                        normal_phase = False
+        elif data.dim() == 5:
+            # RGBD: (B, T, C, H, W)
+            B, T, C, H, W = data.shape
+            for b in range(B):
+                for c in range(C):
+                    t = 0
+                    normal_phase = True
+                    while t < T:
+                        if normal_phase:
+                            length = int(np.random.exponential(s_norm)) + 1
+                        else:
+                            length = int(np.random.exponential(s_corr)) + 1
+                            end = min(t + length, T)
+                            data[b, t:end, c, :, :] = 0.0
+                            t = end
+                            normal_phase = True
+                            continue
+                        t += length
+                        normal_phase = False
+        return data
+
+    def _consec_missing_per_sensor(data, s_norm, s_corr):
+        """Mode 3: Per-sensor consecutive missing (all channels of a modality
+        share the same missing pattern).
+
+        Same as Mode 2 except all channels of a sensor share the same intervals.
+        """
+        if data.dim() == 3:
+            # IMU: (B, T, C) — treat entire sensor as one unit
+            B, T, C = data.shape
+            for b in range(B):
+                t = 0
+                normal_phase = True
+                while t < T:
+                    if normal_phase:
+                        length = int(np.random.exponential(s_norm)) + 1
+                    else:
+                        length = int(np.random.exponential(s_corr)) + 1
+                        end = min(t + length, T)
+                        data[b, t:end, :] = 0.0
+                        t = end
+                        normal_phase = True
+                        continue
+                    t += length
+                    normal_phase = False
+        elif data.dim() == 5:
+            # RGBD: (B, T, C, H, W) — all 4 channels share pattern
+            B, T, C, H, W = data.shape
+            for b in range(B):
+                t = 0
+                normal_phase = True
+                while t < T:
+                    if normal_phase:
+                        length = int(np.random.exponential(s_norm)) + 1
+                    else:
+                        length = int(np.random.exponential(s_corr)) + 1
+                        end = min(t + length, T)
+                        data[b, t:end, :, :, :] = 0.0
+                        t = end
+                        normal_phase = True
+                        continue
+                    t += length
+                    normal_phase = False
+        return data
+
+    # ---- 1. Clean evaluation ----
+    print("\n[1/4] Clean (no corruption)...")
+    acc, f1 = _evaluate_loader(clean_loader)
+    results["clean"] = (acc, f1)
+    print(f"  Clean: Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ---- 2. Mode 1: Gaussian noise ----
+    print("\n[2/4] Mode 1: Gaussian noise N(0,σ) on all channels...")
+    for sigma in SIGMA_LEVELS:
+        def noise_fn(rgbd, imu, _s=sigma):
+            return _add_gaussian_noise_sigma(rgbd, _s), _add_gaussian_noise_sigma(imu, _s)
+        acc, f1 = _evaluate_corrupted(noise_fn)
+        results[f"mode1_sigma{sigma}"] = (acc, f1)
+        print(f"  σ={sigma:.2f}: Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ---- 3. Mode 2: Per-channel consecutive missing ----
+    print("\n[3/4] Mode 2: Per-channel consecutive missing...")
+    for i, (rc, ic) in enumerate(zip(RGBD_S_CORR, IMU_S_CORR)):
+        def consec_ch_fn(rgbd, imu, _rc=rc, _ic=ic):
+            return (_consec_missing_per_channel(rgbd, RGBD_S_NORM, _rc),
+                    _consec_missing_per_channel(imu, IMU_S_NORM, _ic))
+        acc, f1 = _evaluate_corrupted(consec_ch_fn)
+        label = f"mode2_rc{rc}_ic{ic}"
+        results[label] = (acc, f1)
+        print(f"  s_corr(rgbd={rc},imu={ic}): Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ---- 4. Mode 3: Per-sensor consecutive missing ----
+    print("\n[3.5/4] Mode 3: Per-sensor consecutive missing...")
+    for i, (rc, ic) in enumerate(zip(RGBD_S_CORR, IMU_S_CORR)):
+        def consec_sensor_fn(rgbd, imu, _rc=rc, _ic=ic):
+            return (_consec_missing_per_sensor(rgbd, RGBD_S_NORM, _rc),
+                    _consec_missing_per_sensor(imu, IMU_S_NORM, _ic))
+        acc, f1 = _evaluate_corrupted(consec_sensor_fn)
+        label = f"mode3_rc{rc}_ic{ic}"
+        results[label] = (acc, f1)
+        print(f"  s_corr(rgbd={rc},imu={ic}): Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ---- 5. Mode 4: Noise + per-channel consecutive missing ----
+    print("\n[4/4] Mode 4: Noise + per-channel consecutive missing...")
+    mode4_configs = [
+        (0.05, RGBD_S_CORR[0], IMU_S_CORR[0]),
+        (0.1,  RGBD_S_CORR[1], IMU_S_CORR[1]),
+        (0.2,  RGBD_S_CORR[2], IMU_S_CORR[2]),
+    ]
+    for sigma, rc, ic in mode4_configs:
+        def mode4_fn(rgbd, imu, _s=sigma, _rc=rc, _ic=ic):
+            # First noise, then per-channel missing (paper: c4 = c2(c1(x)))
+            rgbd = _add_gaussian_noise_sigma(rgbd, _s)
+            imu  = _add_gaussian_noise_sigma(imu, _s)
+            rgbd = _consec_missing_per_channel(rgbd, RGBD_S_NORM, _rc)
+            imu  = _consec_missing_per_channel(imu, IMU_S_NORM, _ic)
+            return rgbd, imu
+        acc, f1 = _evaluate_corrupted(mode4_fn)
+        label = f"mode4_s{sigma}_rc{rc}_ic{ic}"
+        results[label] = (acc, f1)
+        print(f"  σ={sigma:.2f}, s_corr(rgbd={rc},imu={ic}): Acc={acc:.4f}  F1={f1:.4f}")
+
+    # ---- Summary tables (one per mode) ----
+    clean_acc, clean_f1 = results["clean"]
+    print(f"\n{'='*70}")
+    print(f"  CENTAUR-STYLE ROBUSTNESS EVALUATION — SUMMARY")
+    print(f"{'='*70}")
+
+    # Table 1: Clean
+    print(f"\n--- Baseline ---")
+    print(f"  {'Condition':<40} {'Acc':>8} {'F1':>8}")
+    print(f"  {'Clean (no corruption)':<40} {clean_acc:>8.4f} {clean_f1:>8.4f}")
+
+    # Table 2: Mode 1 — Gaussian noise
+    print(f"\n--- Mode 1: Gaussian Noise N(0,σ) ---")
+    print(f"  {'σ':<40} {'Acc':>8} {'F1':>8}")
+    for sigma in SIGMA_LEVELS:
+        k = f"mode1_sigma{sigma}"
+        acc, f1 = results[k]
+        print(f"  {sigma:<40.2f} {acc:>8.4f} {f1:>8.4f}")
+
+    # Table 3: Mode 2 — per-channel consecutive missing
+    print(f"\n--- Mode 2: Per-Channel Consecutive Missing ---")
+    print(f"  {'s_corr (rgbd, imu)':<40} {'Acc':>8} {'F1':>8}")
+    for rc, ic in zip(RGBD_S_CORR, IMU_S_CORR):
+        k = f"mode2_rc{rc}_ic{ic}"
+        acc, f1 = results[k]
+        print(f"  {'('+str(rc)+', '+str(ic)+')':<40} {acc:>8.4f} {f1:>8.4f}")
+
+    # Table 4: Mode 3 — per-sensor consecutive missing
+    print(f"\n--- Mode 3: Per-Sensor Consecutive Missing ---")
+    print(f"  {'s_corr (rgbd, imu)':<40} {'Acc':>8} {'F1':>8}")
+    for rc, ic in zip(RGBD_S_CORR, IMU_S_CORR):
+        k = f"mode3_rc{rc}_ic{ic}"
+        acc, f1 = results[k]
+        print(f"  {'('+str(rc)+', '+str(ic)+')':<40} {acc:>8.4f} {f1:>8.4f}")
+
+    # Table 5: Mode 4 — combined
+    print(f"\n--- Mode 4: Noise + Per-Channel Missing (c4=c2∘c1) ---")
+    print(f"  {'σ, s_corr (rgbd, imu)':<40} {'Acc':>8} {'F1':>8}")
+    for sigma, rc, ic in mode4_configs:
+        k = f"mode4_s{sigma}_rc{rc}_ic{ic}"
+        acc, f1 = results[k]
+        print(f"  {f'{sigma:.2f}, ({rc}, {ic})':<40} {acc:>8.4f} {f1:>8.4f}")
+
+    # Overall summary
+    corrupted = {k: v for k, v in results.items() if k != "clean"}
+    avg_acc = np.mean([v[0] for v in corrupted.values()])
+    avg_f1  = np.mean([v[1] for v in corrupted.values()])
+    print(f"\n{'-'*60}")
+    print(f"  {'Avg (all corrupted)':<40} {avg_acc:>8.4f} {avg_f1:>8.4f}")
+    print(f"  {'Robustness ratio (corrupted/clean)':<40} {avg_acc/clean_acc:>8.4f}")
+    print(f"{'='*70}")
+
+    return results
 
 
 # ================================================================
@@ -560,6 +1070,14 @@ def main():
     if args.eval_missing != "none" and not is_ensemble:
         _eval_missing(model, test_loader, criterion, device, pipeline_cfg,
                       infer_args, args, results)
+        return
+
+    # -- Comprehensive robustness evaluation (Centaur-style) --
+    if args.eval_robustness and not is_ensemble:
+        _eval_robustness(model, DatasetClass, data_key, args.data_root,
+                         cfg.get("default_dataset_kwargs", {}),
+                         user_ds_kw, norm_keys,
+                         device, args.batch_size, args.num_workers, args)
         return
 
     print(f"\nTest Results ({n} samples):")

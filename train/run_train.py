@@ -226,7 +226,8 @@ def _build_modality_dropout_kwargs(args) -> dict | None:
 
 def create_datasets(DatasetClass, data_key, data_root,
                     default_ds_kwargs, user_ds_kwargs, norm_keys,
-                    modality_dropout_kwargs=None):
+                    modality_dropout_kwargs=None,
+                    sensor_corruption_kwargs=None):
     """Create train and test datasets with proper normalisation propagation."""
     base_kw = {}
     base_kw.update(default_ds_kwargs)
@@ -240,6 +241,9 @@ def create_datasets(DatasetClass, data_key, data_root,
     # Inject modality dropout into training set only
     if modality_dropout_kwargs and _accepts_kwarg(DatasetClass, "modality_dropout"):
         train_kw["modality_dropout"] = modality_dropout_kwargs
+    # Inject sensor corruption augmentation into training set only
+    if sensor_corruption_kwargs and _accepts_kwarg(DatasetClass, "sensor_corruption"):
+        train_kw["sensor_corruption"] = sensor_corruption_kwargs
     train_ds = DatasetClass(**train_kw)
 
     # -- Test --
@@ -381,6 +385,29 @@ def parse_args():
     p.add_argument("--corruption_both_drop_prob", type=float, default=0.0,
                    help="Probability that both modalities are dropped")
 
+    # Sensor corruption augmentation (Centaur-style, training-time)
+    p.add_argument("--sensor_corrupt_p", type=float, default=0.0,
+                   help="Probability of applying sensor corruption per sample (0 = disabled)")
+    p.add_argument("--sensor_corrupt_sigma_max", type=float, default=0.25,
+                   help="Max Gaussian noise sigma for corruption augmentation")
+    p.add_argument("--sensor_corrupt_sigma_min", type=float, default=0.02,
+                   help="Min Gaussian noise sigma for corruption augmentation")
+    p.add_argument("--sensor_corrupt_noise_only", action="store_true",
+                   help="Only apply Gaussian noise (Mode 1), skip temporal missing")
+    p.add_argument("--sensor_corrupt_mode_weights", type=float, nargs=4,
+                   default=None, metavar=("M1", "M2", "M3", "M4"),
+                   help="Relative weights for corruption Modes 1-4 (default: equal)")
+    p.add_argument("--sensor_corrupt_rgbd_s_corr_max", type=float, default=6.0,
+                   help="Max RGBD s_corr for consecutive missing augmentation")
+    p.add_argument("--sensor_corrupt_imu_s_corr_max", type=float, default=45.0,
+                   help="Max IMU s_corr for consecutive missing augmentation")
+
+    # Centaur-style Cleaning DAE (frozen, applied before model)
+    p.add_argument("--cleaning_dae_ckpt", type=str, default=None,
+                   help="Path to trained CleaningDAE checkpoint (.pt). "
+                        "Data is passed through the frozen DAE before "
+                        "the HAR model during both training and evaluation.")
+
     p.add_argument("--patience", type=int, default=20,
                    help="Early stopping patience (0 = disabled)")
     p.add_argument("--early_stop_metric", type=str, default="acc",
@@ -462,12 +489,32 @@ def main():
               f"p_full={modality_dropout_kwargs['p_full']}, "
               f"p_consec={modality_dropout_kwargs['p_consecutive']}")
 
+    # -- Sensor corruption augmentation --
+    sensor_corruption_kwargs = None
+    if args.sensor_corrupt_p > 0:
+        sensor_corruption_kwargs = {
+            "p_apply": args.sensor_corrupt_p,
+            "sigma_range": (args.sensor_corrupt_sigma_min,
+                            args.sensor_corrupt_sigma_max),
+            "rgbd_s_corr_range": (1.0, args.sensor_corrupt_rgbd_s_corr_max),
+            "imu_s_corr_range": (10.0, args.sensor_corrupt_imu_s_corr_max),
+        }
+        if args.sensor_corrupt_noise_only:
+            sensor_corruption_kwargs["mode_weights"] = (1, 0, 0, 0)
+        elif args.sensor_corrupt_mode_weights is not None:
+            sensor_corruption_kwargs["mode_weights"] = tuple(args.sensor_corrupt_mode_weights)
+        noise_tag = " [noise-only]" if args.sensor_corrupt_noise_only else ""
+        print(f"SensorCorruption: p={args.sensor_corrupt_p}, "
+              f"σ=[{args.sensor_corrupt_sigma_min}, {args.sensor_corrupt_sigma_max}]"
+              f"{noise_tag}")
+
     # -- Datasets --
     train_ds, test_ds = create_datasets(
         DatasetClass, data_key, args.data_root,
         cfg.get("default_dataset_kwargs", {}),
         user_ds_kw, norm_keys,
         modality_dropout_kwargs=modality_dropout_kwargs,
+        sensor_corruption_kwargs=sensor_corruption_kwargs,
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -503,6 +550,25 @@ def main():
         "input_mode": input_mode,
         "output_mode": output_mode,
     }
+
+    # -- Load frozen Cleaning DAE (if provided) --
+    if args.cleaning_dae_ckpt:
+        from model.cleaning_dae import CleaningDAE
+        dae_ckpt = torch.load(args.cleaning_dae_ckpt, map_location=device,
+                              weights_only=False)
+        cleaning_dae = CleaningDAE(
+            enable_imu=dae_ckpt.get("enable_imu", True),
+            enable_rgbd=dae_ckpt.get("enable_rgbd", True),
+            imu_latent_dim=dae_ckpt.get("latent_dim", 64),
+        ).to(device)
+        cleaning_dae.load_state_dict(dae_ckpt["model_state"])
+        cleaning_dae.eval()
+        for p in cleaning_dae.parameters():
+            p.requires_grad_(False)
+        pipeline_cfg["cleaning_dae"] = cleaning_dae
+        print(f"Cleaning DAE: {args.cleaning_dae_ckpt} "
+              f"(imu={dae_ckpt.get('enable_imu')}, "
+              f"rgbd={dae_ckpt.get('enable_rgbd')}, frozen)")
 
     # -- Optimizer --
     if args.optimizer == "adamw":

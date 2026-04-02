@@ -6,14 +6,12 @@ Last Updated: 2026-03-31
 **MMA (Momentum Mamba / Momentum Multimodal Attention)** 是一个面向人体动作识别 (HAR) 的多模态深度学习项目。基于 UTD-MHAD 数据集，实现了三种不同模态组合的训练管线，并包含一个协作式多任务多模态融合基线 (MuMu)。
 
 **核心方法:**
-- **Momentum Mamba (MMA):** 在 Mamba 选择性状态空间模型 (SSM) 中引入动量机制 (real / complex)，增强时序建模能力
-- **MMA-MMTSA:** 结合 Gramian Angular Field (GAF) 成像、时间段稀疏采样 (Temporal Segment Sampling) 与动量注意力融合
-- **Multimodal MMA (RGB-D + IMU):** 基于跨模态 Mamba 架构，融合 RGB-D 视频和 IMU 传感器数据，支持 PretrainedCNN (ResNet18) 和 SpatialCNN 编码器；引入 Feature-level Modality Dropout (MD-Drop) 和 Cross-Modal Alignment Regularization (CMAR) 以提升单模态缺失鲁棒性 (**最佳: Full=0.9093, RGBD-only=0.4163, IMU-only=0.8628**)
-- **Multimodal MMA (Skeleton + IMU):** 基于跨模态 Mamba 架构，融合骨骼关节序列和 IMU 传感器数据 (**最佳方法: Acc=0.9628**)
+- **Momentum Mamba (MMA):** 在 Mamba 选择性状态空间模型 (SSM) [1] 中引入二阶动量机制 (real / complex)，增强时序建模能力
+- **Multimodal MMA (RGB-D + IMU):** 基于跨模态 Mamba (Cross-Mamba) 架构，融合 RGB-D 视频和 IMU 传感器数据，支持 PretrainedCNN (ResNet18) [2] 和 SpatialCNN 编码器；引入 Feature-level Modality Dropout (MD-Drop) [3] 和 Cross-Modal Alignment Regularization (CMAR) 以提升单模态缺失鲁棒性 (**最佳: Full=0.9093, RGBD-only=0.4163, IMU-only=0.8628**)
 
 **关键特性:**
 - **统一训练 / 推理入口:** `train/run_train.py` + `infer/run_infer.py`，通过 Pipeline Registry 管理所有模型 (含 baseline)
-- 三种独立训练管线：纯 IMU、Depth + IMU (GAF)、RGB-D + IMU
+- 主要训练管线：RGB-D + IMU (支持多种编码器与融合策略)
 - Momentum SSM：二阶动量扫描 (real / complex 两种模式)
 - **ConvNeXt-V2 预训练骨干网络**：可作为视觉编码器替换自定义 CNN，同时支持 IMU-GAF 图像编码
 - 多种融合策略：attention、gated、concat
@@ -45,8 +43,7 @@ COMP 4901D/
 │   ├── encoders.py                    # RGBDEncoder, IMUEncoder
 │   ├── mma_utdmad.py                  # MomentumMambaHAR (纯 IMU)
 │   ├── mma_mmtsa.py                   # MMA_MMTSA (Depth + IMU/GAF)
-│   ├── mma_rgbd_imu.py                # MultimodalMMA (RGB-D + IMU)
-│   ├── mma_skel_imu.py                # MMA_SkeletonIMU (Skeleton + IMU) ★ Best
+│   ├── mma_rgbd_imu.py                # MultimodalMMA (RGB-D + IMU) ★ Best
 │   └── backbones/
 │       ├── __init__.py
 │       ├── convnextv2.py              # ConvNeXt-V2 预训练编码器 (via timm)
@@ -105,10 +102,9 @@ COMP 4901D/
 
 | Pipeline  | Model Class         | Dataset Class           | input_mode | output_mode  |
 |-----------|---------------------|-------------------------|------------|--------------|
+| `rgbd_imu`| `MultimodalMMA`     | `UTDMADRGBDIMUDataset`  | unpack     | logits       |
 | `utdmad`  | `MomentumMambaHAR`  | `UTDMADInertialDataset` | unpack     | logits       |
 | `mmtsa`   | `MMA_MMTSA`         | `UTD_MHAD_Dataset`      | unpack     | tuple_first  |
-| `skel_imu`| `MMA_SkeletonIMU`   | `UTDMADSkelIMUDataset`  | unpack     | logits       |
-| `rgbd_imu`| `MultimodalMMA`     | `UTDMADRGBDIMUDataset`  | unpack     | logits       |
 | `mumu`    | `MuMu`              | (user-provided)         | list       | mumu         |
 
 **IO 模式说明:**
@@ -293,8 +289,7 @@ tensorboard --logdir runs
 |------|--------|------|------|
 | `MomentumMambaHAR` | ~321K | `(B, L, 6)` | `(B, 27)` logits |
 | `MMA_MMTSA` | ~4.3M | `(depth, imu)` | `(logits, aux_dict)` |
-| `MultimodalMMA` | ~9.6M | `(rgbd, imu)` | `(B, 27)` logits |
-| `MMA_SkeletonIMU` | ~450K | `(skel, imu)` | `(B, 27)` logits |
+| `MultimodalMMA` | ~2.9M (trainable) | `(rgbd, imu)` | `(B, 27)` logits |
 | `MuMu` | ~448K | `[x_list]` | `(y_aux, y_target, alpha, attn)` |
 
 ### 数据集包 `datasets/`
@@ -453,7 +448,6 @@ IMU (T,6) → 归一化 ─────────────┘ → Multimoda
 
 | 文件 | 管线 | 融合 | Acc | 说明 |
 |------|------|------|-----|------|
-| `checkpoints/skel_imu_exp25.pt` | skel_imu | cross_mamba | **0.9628** | ★ 骨骼+IMU 最佳 |
 | `checkpoints/rgbd_imu_CMAR1.pt` | rgbd_imu | cross_mamba | **0.9093** | ★ RGBD+IMU 最佳 (CMAR + MD-Drop) |
 | `checkpoints/rgbd_imu_MDdrop1.pt` | rgbd_imu | cross_mamba | 0.8860 | MD-Drop 消融 |
 | `checkpoints/rgbd_imu_R4.pt` | rgbd_imu | cross_mamba | 0.8977 | 无缺失鲁棒化基线 |
@@ -468,14 +462,12 @@ IMU (T,6) → 归一化 ─────────────┘ → Multimoda
 
 | Pipeline | Model | Best Acc | Best F1 | RGBD-only | IMU-only | Key Config | Checkpoint |
 |----------|-------|----------|---------|-----------|----------|------------|------------|
-| **Skeleton + IMU** | MMA_SkeletonIMU | **0.9628** | **0.9622** | N/A | N/A | cross_mamba, aux=0.1, d=160, bs=16, lr=3e-4 | `skel_imu_exp25.pt` |
 | **RGBD + IMU (robust)** | MultimodalMMA | **0.9093** | **0.9061** | **0.4163** | **0.8628** | CMAR+MDdrop, md_drop_imu=0.35, cmar_weight=0.1 | `rgbd_imu_CMAR1.pt` |
 | RGBD + IMU (baseline) | MultimodalMMA | 0.8977 | 0.8951 | 0.1419 | 0.7302 | ResNet18 partial, vel+aug, cross_mamba, aux=0.1 | `rgbd_imu_R4.pt` |
 
 **推荐方法:**
-- **有骨骼数据时:** Skeleton+IMU (Exp25) — 96.28% 准确率，轻量级 (~450K 参数)
-- **无骨骼数据时:** RGBD+IMU CMAR1 — 90.93% 准确率，且在单模态缺失下保持鲁棒 (RGBD 41.63%, IMU 86.28%)
-- **若不需要缺失鲁棒性:** RGBD+IMU R4 — 89.77%，更快训练 (bs=8)
+- **需要缺失鲁棒性时:** RGBD+IMU CMAR1 — 90.93% 准确率，且在单模态缺失下保持鲁棒 (RGBD 41.63%, IMU 86.28%)
+- **不需要缺失鲁棒性时:** RGBD+IMU R4 — 89.77%，更快训练 (bs=8)
 
 详细实验报告见 `experiment_report.md`。
 
@@ -489,3 +481,13 @@ conda activate mma
 ```
 
 核心依赖: `torch`, `numpy`, `scipy`, `scikit-learn`, `matplotlib`, `tensorboard`, `timm`, `opencv-python`
+
+---
+
+## References
+
+[1] A. Gu and T. Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces," *ICLR*, 2024.
+
+[2] K. He, X. Zhang, S. Ren, and J. Sun, "Deep Residual Learning for Image Recognition," *CVPR*, 2016.
+
+[3] N. Neverova, C. Wolf, G. Taylor, and F. Nebout, "ModDrop: Adaptive Multi-modal Gesture Recognition," *IEEE TPAMI*, 2016.

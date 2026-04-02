@@ -72,12 +72,28 @@ class MultimodalMMA(nn.Module):
         # Cross-Modal Alignment Regularization (CMAR)
         cmar_weight: float = 0.0,
         cmar_proj_dim: int = 64,
+        cmar_loss_type: str = "mse",  # "mse", "cosine", "barlow"
+        md_drop_mode: str = "exclusive",  # "exclusive" or "independent"
+        md_drop_curriculum: bool = False,  # ramp up md_drop_imu linearly over training
+        md_drop_curriculum_reverse: bool = False,  # start at max, ramp down to 0
+        feature_noise_std: float = 0.0,  # Gaussian noise injected into encoded features
+        temporal_mask_ratio: float = 0.0,  # Fraction of timesteps to mask in features
+        # Temporal denoising filter (applied in encoders at train+eval)
+        denoise_mode: str = "none",        # "none","moving_avg","gaussian","learnable","ema","kalman"
+        denoise_kernel_size: int = 5,
+        denoise_sigma: float = 1.0,
+        imu_denoise_mode: str = None,      # per-modality override (None = use denoise_mode)
+        rgbd_denoise_mode: str = None,     # per-modality override (None = use denoise_mode)
     ):
         super().__init__()
         self.fusion_mode = fusion
         self.aux_weight = aux_weight
         self._aux_logits = None
         self.d_model = d_model
+
+        # Feature-level noise injection
+        self.feature_noise_std = feature_noise_std
+        self.temporal_mask_ratio = temporal_mask_ratio
 
         # Modality dropout config
         self.md_schedule = md_schedule if md_schedule != "none" else (
@@ -87,8 +103,13 @@ class MultimodalMMA(nn.Module):
         self.md_warmup_frac = md_warmup_frac
         self.md_lambda = md_lambda
         self.md_drop_imu = md_drop_imu
+        self.md_drop_imu_max = md_drop_imu  # store max for curriculum
         self.md_drop_rgbd = md_drop_rgbd
+        self.md_drop_mode = md_drop_mode
+        self.md_drop_curriculum = md_drop_curriculum
+        self.md_drop_curriculum_reverse = md_drop_curriculum_reverse
         self.cmar_weight = cmar_weight
+        self.cmar_loss_type = cmar_loss_type
         self._cmar_loss = None
 
         # Epoch tracking (set externally by training loop)
@@ -124,6 +145,10 @@ class MultimodalMMA(nn.Module):
         else:
             enc_name = "spatial_cnn"
 
+        # Resolve per-modality denoise modes
+        _rgbd_dn = rgbd_denoise_mode if rgbd_denoise_mode is not None else denoise_mode
+        _imu_dn = imu_denoise_mode if imu_denoise_mode is not None else denoise_mode
+
         self.rgbd_enc = RGBDEncoder(
             **mamba_kw,
             encoder=enc_name,
@@ -135,6 +160,9 @@ class MultimodalMMA(nn.Module):
             temporal_diff_mode=temporal_diff_mode,
             use_frame_diff=use_frame_diff,
             diff_channels=diff_channels,
+            denoise_mode=_rgbd_dn,
+            denoise_kernel_size=denoise_kernel_size,
+            denoise_sigma=denoise_sigma,
         )
         self.imu_enc = IMUEncoder(
             in_channels=6, **mamba_kw,
@@ -142,6 +170,9 @@ class MultimodalMMA(nn.Module):
             convnext_model=convnext_model,
             freeze_stages=freeze_stages,
             gaf_size=gaf_size,
+            denoise_mode=_imu_dn,
+            denoise_kernel_size=denoise_kernel_size,
+            denoise_sigma=denoise_sigma,
         )
 
         # --- Fusion ---
@@ -247,28 +278,68 @@ class MultimodalMMA(nn.Module):
         if fi is None:
             fi = self._apply_missing_token(None, self.missing_token_imu, ref)
 
+        # --- CMAR: Cross-Modal Alignment Regularization ---
+        # Must be computed on CLEAN features BEFORE any dropout/masking.
+        self._cmar_loss = None
+        if self.training and self.cmar_weight > 0:
+            fv_proj = self.cmar_proj_rgbd(fv.mean(dim=1))  # (B, proj_dim)
+            fi_proj = self.cmar_proj_imu(fi.mean(dim=1))   # (B, proj_dim)
+            if self.cmar_loss_type == "cosine":
+                cos_sim = nn.functional.cosine_similarity(fv_proj, fi_proj, dim=1)
+                self._cmar_loss = torch.mean(1.0 - cos_sim)
+            elif self.cmar_loss_type == "barlow":
+                fv_n = (fv_proj - fv_proj.mean(0)) / (fv_proj.std(0) + 1e-5)
+                fi_n = (fi_proj - fi_proj.mean(0)) / (fi_proj.std(0) + 1e-5)
+                cc = (fv_n.T @ fi_n) / fv_n.size(0)
+                on_diag = ((1 - cc.diagonal()) ** 2).sum()
+                off_diag = (cc.flatten()[1:].view(cc.size(0)-1, cc.size(0)+1)[:, :-1] ** 2).sum()
+                self._cmar_loss = on_diag + 0.005 * off_diag
+            else:
+                self._cmar_loss = torch.mean((fv_proj - fi_proj) ** 2)
+
         # --- Simultaneous mode (training only) ---
         if self.training and self.md_schedule == "simultaneous":
             return self._forward_simultaneous(fv, fi)
 
         # --- Feature-level modality dropout (MD-Drop) ---
         if self.training and (self.md_drop_imu > 0 or self.md_drop_rgbd > 0):
-            r = random.random()
-            if r < self.md_drop_imu:
-                fi = torch.zeros_like(fi)
-            elif r < self.md_drop_imu + self.md_drop_rgbd:
-                fv = torch.zeros_like(fv)
+            # Curriculum: ramp md_drop_imu from 0 to max over training
+            effective_imu_drop = self.md_drop_imu
+            if self.md_drop_curriculum and self.total_epochs > 1:
+                progress = self.current_epoch / (self.total_epochs - 1)
+                effective_imu_drop = self.md_drop_imu_max * progress
+            elif self.md_drop_curriculum_reverse and self.total_epochs > 1:
+                progress = self.current_epoch / (self.total_epochs - 1)
+                effective_imu_drop = self.md_drop_imu_max * (1.0 - progress)
+            if self.md_drop_mode == "independent":
+                if random.random() < effective_imu_drop:
+                    fi = torch.zeros_like(fi)
+                if random.random() < self.md_drop_rgbd:
+                    fv = torch.zeros_like(fv)
+            else:
+                r = random.random()
+                if r < effective_imu_drop:
+                    fi = torch.zeros_like(fi)
+                elif r < effective_imu_drop + self.md_drop_rgbd:
+                    fv = torch.zeros_like(fv)
 
-        # --- CMAR: Cross-Modal Alignment Regularization ---
-        # Align projected RGBD and IMU sequences before fusion.
-        # Loss is stored for the trainer to add to the total loss.
-        self._cmar_loss = None
-        if self.training and self.cmar_weight > 0:
-            # Mean-pool over the time dimension for sequence-level alignment
-            # (avoids needing equal sequence lengths between RGBD and IMU)
-            fv_proj = self.cmar_proj_rgbd(fv.mean(dim=1))  # (B, proj_dim)
-            fi_proj = self.cmar_proj_imu(fi.mean(dim=1))   # (B, proj_dim)
-            self._cmar_loss = torch.mean((fv_proj - fi_proj) ** 2)
+        # --- Feature-level noise injection (after CMAR, before fusion) ---
+        if self.training and self.feature_noise_std > 0:
+            fv = fv + torch.randn_like(fv) * self.feature_noise_std
+            fi = fi + torch.randn_like(fi) * self.feature_noise_std
+
+        # --- Temporal feature masking (after CMAR, before fusion) ---
+        if self.training and self.temporal_mask_ratio > 0 and random.random() < 0.3:
+            B_v, T_v, _ = fv.shape
+            n_mask_v = max(1, int(T_v * self.temporal_mask_ratio))
+            for b in range(B_v):
+                idx = torch.randperm(T_v, device=fv.device)[:n_mask_v]
+                fv[b, idx] = 0.0
+            B_i, T_i, _ = fi.shape
+            n_mask_i = max(1, int(T_i * self.temporal_mask_ratio))
+            for b in range(B_i):
+                idx = torch.randperm(T_i, device=fi.device)[:n_mask_i]
+                fi[b, idx] = 0.0
 
         # --- Auxiliary outputs (full modality) ---
         self._aux_logits = None
